@@ -1,0 +1,32 @@
+# Caddy configuration for Meeting Room Booking
+# Listens on HTTP Port 80 on 192.168.50.143
+
+http://192.168.50.143:80, http://localhost:80 {
+    # Reverse proxy to Next.js
+    reverse_proxy 127.0.0.1:3000 {
+        # Keepalive and headers for SSE & WebSockets
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto http
+        
+        # Disable response buffering for Server-Sent Events (SSE)
+        flush_interval -1
+    }
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options SAMEORIGIN
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    # Logging
+    log {
+        output file C:\inetpub\meeting-room-system\logs\access.log {
+            roll_size 10mb
+            roll_keep 10
+        }
+    }
+}

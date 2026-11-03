@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --corporate-navy: #0B1F3A;
+  --corporate-teal: #0F4C5C;
+  --corporate-charcoal: #1F2933;
+  --corporate-offwhite: #F7F5F0;
+  --corporate-softgrey: #E5E7EB;
+  --corporate-border: #E2E8F0;
+}
+
+body {
+  background-color: var(--corporate-offwhite);
+  color: var(--corporate-charcoal);
+  font-feature-settings: "rlig" 1, "calt" 1, "cv11" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom hairline borders */
+.border-hairline {
+  border-width: 1px;
+  border-color: #E2E8F0;
+}
+
+/* Subtle scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Kiosk mode cursor hiding */
+.kiosk-mode {
+  cursor: none !important;
+  user-select: none !important;
+  overflow: hidden !important;
+}
+
+/* Print stylesheets for A4 and Tabloid QR signs */
+@media print {
+  body {
+    background: white !important;
+    color: black !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-only {
+    display: block !important;
+  }
+  @page {
+    margin: 10mm;
+  }
+}

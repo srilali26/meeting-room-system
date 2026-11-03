@@ -1,0 +1,15 @@
+[Unit]
+Description=Meeting Room Display Kiosk Service
+After=network.target graphical.target
+
+[Service]
+Type=simple
+User=kiosk
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/kiosk/.Xauthority
+ExecStart=/usr/bin/chromium-browser --noerrdialogs --disable-infobars --kiosk http://192.168.50.143/display/11111111-1111-1111-1111-111111111111 --check-for-update-interval=31536000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
