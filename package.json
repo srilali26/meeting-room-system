@@ -6,7 +6,7 @@
     "dev": "next dev -p 3000 -H 0.0.0.0",
     "build": "next build",
     "start": "next start -p 80 -H 0.0.0.0",
-    "start:local": "next start -p 3000 -H 0.0.0.0",
+    "start:local": "next start -p 3005 -H 0.0.0.0",
     "create-admin": "tsx scripts/create-admin.mjs",
     "reset-admin": "tsx scripts/reset-admin.mjs",
     "test": "tsx scripts/run-tests.mjs",

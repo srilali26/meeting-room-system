@@ -1,5 +1,41 @@
+import fs from 'fs';
+import path from 'path';
+import { Pool, PoolClient } from 'pg';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+
+// Auto-load .env or .env.local if not already loaded by Next.js
+function loadEnvFile() {
+  if (process.env.DATABASE_URL) return;
+  const candidates = [
+    path.resolve(process.cwd(), '.env.local'),
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(__dirname, '../../.env.local'),
+    path.resolve(__dirname, '../../.env'),
+  ];
+  for (const envPath of candidates) {
+    if (fs.existsSync(envPath)) {
+      try {
+        const content = fs.readFileSync(envPath, 'utf8');
+        for (const rawLine of content.split('\n')) {
+          const trimmed = rawLine.trim();
+          if (!trimmed || trimmed.startsWith('#')) continue;
+          const eqIdx = trimmed.indexOf('=');
+          if (eqIdx !== -1) {
+            const key = trimmed.slice(0, eqIdx).trim();
+            const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"](.*)['"]$/, '$1');
+            if (!process.env[key]) {
+              process.env[key] = val;
+            }
+          }
+        }
+      } catch (e) {
+        // ignore read error
+      }
+    }
+  }
+}
+loadEnvFile();
 import {
   Room,
   Booking,
@@ -16,7 +52,42 @@ import {
   DEFAULT_SETTINGS,
   computeRoomStatus,
 } from './timezone';
-import { parseISO, isBefore, isAfter, addDays } from 'date-fns';
+import { parseISO, isBefore, isAfter } from 'date-fns';
+
+// ---------------------------------------------------------------------------
+// Pure PostgreSQL Connection Pool (Zero in-memory fallback)
+// ---------------------------------------------------------------------------
+function getDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url || !url.trim()) {
+    throw new Error(
+      'FATAL: DATABASE_URL is not defined in environment. PostgreSQL is required. The system will not run with an in-memory fallback.'
+    );
+  }
+  return url.trim();
+}
+
+const globalForPg = globalThis as unknown as {
+  __PG_POOL__?: Pool;
+  __PG_LISTEN_CLIENT__?: PoolClient;
+};
+
+export function getPool(): Pool {
+  if (!globalForPg.__PG_POOL__) {
+    const connectionString = getDatabaseUrl();
+    globalForPg.__PG_POOL__ = new Pool({
+      connectionString,
+      max: 20,
+      idleTimeoutMillis: 30000,
+      connectionTimeoutMillis: 5000,
+    });
+
+    globalForPg.__PG_POOL__.on('error', (err) => {
+      console.error('Unexpected error on idle PostgreSQL client:', err);
+    });
+  }
+  return globalForPg.__PG_POOL__;
+}
 
 // ---------------------------------------------------------------------------
 // In-Memory SSE Event Hub (Zero-latency push to connected clients)
@@ -43,273 +114,136 @@ export function broadcastRealtimeEvent(event: RealtimeEvent) {
     try {
       listener(event);
     } catch (e) {
-      // Ignored for dead clients
+      // dead client
     }
   });
 }
 
 // ---------------------------------------------------------------------------
-// Seed Data: 5 Default Meeting Rooms
-// ---------------------------------------------------------------------------
-const SEED_ROOMS: Room[] = [
-  {
-    id: '11111111-1111-1111-1111-111111111111',
-    name: 'Meeting Room 1',
-    location: 'Floor 1, Main Wing',
-    capacity: 16,
-    amenities: ['4K Dual Display', 'Video Conferencing Kit', 'Conference Phone', 'Digital Whiteboard', 'High-speed Wi-Fi'],
-    is_active: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: '22222222-2222-2222-2222-222222222222',
-    name: 'Meeting Room 2',
-    location: 'Floor 2, East Wing',
-    capacity: 8,
-    amenities: ['Touchscreen Smart Board', 'Video Conferencing', 'Modular Desks', 'Wireless Presentation'],
-    is_active: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: '33333333-3333-3333-3333-333333333333',
-    name: 'Meeting Room 3',
-    location: 'Floor 2, Quiet Zone',
-    capacity: 4,
-    amenities: ['Ultra-wide Monitor', 'Acoustic Soundproofing', 'Ergonomic Seating', 'High-speed Wi-Fi'],
-    is_active: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: '44444444-4444-4444-4444-444444444444',
-    name: 'Meeting Room 4',
-    location: 'Floor 3, West Wing',
-    capacity: 10,
-    amenities: ['4K Display', 'Video Bar', 'Whiteboard', 'Conference Table'],
-    is_active: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: '55555555-5555-5555-5555-555555555555',
-    name: 'Meeting Room 5',
-    location: 'Floor 3, Collaboration Hub',
-    capacity: 6,
-    amenities: ['Touchscreen TV', 'Modular Seating', 'Wireless Screen Mirroring'],
-    is_active: true,
-    created_at: new Date().toISOString(),
-  },
-];
-
-const SEED_SCREENS: DisplayScreen[] = [
-  {
-    id: 'd1111111-1111-1111-1111-111111111111',
-    name: 'Meeting Room 1 Display',
-    room_id: '11111111-1111-1111-1111-111111111111',
-    media_player_ip: '192.168.50.201',
-    orientation: 'landscape',
-    display_token: 'token-screen-room-1',
-    last_heartbeat_at: new Date().toISOString(),
-    is_online: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: 'd2222222-2222-2222-2222-222222222222',
-    name: 'Meeting Room 2 Display',
-    room_id: '22222222-2222-2222-2222-222222222222',
-    media_player_ip: '192.168.50.202',
-    orientation: 'landscape',
-    display_token: 'token-screen-room-2',
-    last_heartbeat_at: new Date().toISOString(),
-    is_online: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: 'd3333333-3333-3333-3333-333333333333',
-    name: 'Meeting Room 3 Display',
-    room_id: '33333333-3333-3333-3333-333333333333',
-    media_player_ip: '192.168.50.203',
-    orientation: 'portrait',
-    display_token: 'token-screen-room-3',
-    last_heartbeat_at: new Date().toISOString(),
-    is_online: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: 'd4444444-4444-4444-4444-444444444444',
-    name: 'Meeting Room 4 Display',
-    room_id: '44444444-4444-4444-4444-444444444444',
-    media_player_ip: '192.168.50.204',
-    orientation: 'landscape',
-    display_token: 'token-screen-room-4',
-    last_heartbeat_at: new Date().toISOString(),
-    is_online: true,
-    created_at: new Date().toISOString(),
-  },
-  {
-    id: 'd5555555-5555-5555-5555-555555555555',
-    name: 'Meeting Room 5 Display',
-    room_id: '55555555-5555-5555-5555-555555555555',
-    media_player_ip: '192.168.50.205',
-    orientation: 'landscape',
-    display_token: 'token-screen-room-5',
-    last_heartbeat_at: new Date().toISOString(),
-    is_online: true,
-    created_at: new Date().toISOString(),
-  },
-];
-
-const SEED_BLOCKS: BlockedSlot[] = [
-  {
-    id: 'bbbb0000-0000-0000-0000-000000000001',
-    room_id: null, // applies to all rooms
-    title: 'Friday Prayer & Building Maintenance',
-    reason: 'Regular weekly maintenance and Friday prayer break across all meeting rooms',
-    start_time: new Date().toISOString(),
-    end_time: addDays(new Date(), 365).toISOString(),
-    recurring_rule: 'FRIDAY_12_14',
-    created_by: 'admin',
-    created_at: new Date().toISOString(),
-  },
-];
-
-function getInitialBookings(): Booking[] {
-  const todayStr = formatInDubai(new Date(), 'yyyy-MM-dd');
-  return [
-    {
-      id: 'b1111111-1111-1111-1111-111111111111',
-      room_id: '11111111-1111-1111-1111-111111111111',
-      title: 'Quarterly Strategy Alignment',
-      organizer_name: 'Sarah Al Mansoor',
-      organizer_email: 'sarah.mansoor@example.com',
-      start_time: createDubaiDateTime(todayStr, 9, 0).toISOString(),
-      end_time: createDubaiDateTime(todayStr, 10, 30).toISOString(),
-      notes: 'In-person presentation and leadership sync.',
-      cancel_token: 'token-sample-sarah-1',
-      status: 'confirmed',
-      created_at: new Date().toISOString(),
-    },
-    {
-      id: 'b2222222-2222-2222-2222-222222222222',
-      room_id: '11111111-1111-1111-1111-111111111111',
-      title: 'Operations Review',
-      organizer_name: 'Tariq Mahmoud',
-      organizer_email: 'tariq.m@example.com',
-      start_time: createDubaiDateTime(todayStr, 14, 0).toISOString(),
-      end_time: createDubaiDateTime(todayStr, 15, 30).toISOString(),
-      notes: 'Monthly KPIs and logistics roadmap.',
-      cancel_token: 'token-sample-tariq-2',
-      status: 'confirmed',
-      created_at: new Date().toISOString(),
-    },
-    {
-      id: 'b3333333-3333-3333-3333-333333333333',
-      room_id: '22222222-2222-2222-2222-222222222222',
-      title: 'Design Sprint Workshop',
-      organizer_name: 'Elena Rostova',
-      organizer_email: 'elena.r@example.com',
-      start_time: createDubaiDateTime(todayStr, 11, 0).toISOString(),
-      end_time: createDubaiDateTime(todayStr, 12, 30).toISOString(),
-      notes: 'User flow prototyping.',
-      cancel_token: 'token-sample-elena-3',
-      status: 'confirmed',
-      created_at: new Date().toISOString(),
-    },
-  ];
-}
-
-// ---------------------------------------------------------------------------
-// In-Memory Persistent Store on globalThis
-// ---------------------------------------------------------------------------
-interface DataStore {
-  rooms: Room[];
-  bookings: Booking[];
-  blockedSlots: BlockedSlot[];
-  displayScreens: DisplayScreen[];
-  adminUser: AdminUser | null;
-  sessions: AdminSession[];
-  auditLogs: AuditLog[];
-  settings: AppSettings;
-}
-
-const g = globalThis as unknown as { __MEETING_ROOM_STORE__?: DataStore };
-
-if (!g.__MEETING_ROOM_STORE__) {
-  // Default admin: username "admin", password "admin123" (bcrypt hash), PIN "1234"
-  const defaultPasswordHash = bcrypt.hashSync('admin123', 10);
-  const defaultPinHash = bcrypt.hashSync('1234', 10);
-
-  g.__MEETING_ROOM_STORE__ = {
-    rooms: [...SEED_ROOMS],
-    bookings: getInitialBookings(),
-    blockedSlots: [...SEED_BLOCKS],
-    displayScreens: [...SEED_SCREENS],
-    adminUser: {
-      id: 'a0000000-0000-0000-0000-000000000001',
-      username: 'admin',
-      password_hash: defaultPasswordHash,
-      pin_hash: defaultPinHash,
-      failed_attempts: 0,
-      locked_until: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    },
-    sessions: [],
-    auditLogs: [
-      {
-        id: crypto.randomUUID(),
-        action: 'SYSTEM_INIT',
-        actor: 'system',
-        ip_address: '127.0.0.1',
-        details: { message: 'Meeting room system initialized' },
-        created_at: new Date().toISOString(),
-      },
-    ],
-    settings: { ...DEFAULT_SETTINGS },
-  };
-}
-
-const store = g.__MEETING_ROOM_STORE__;
-
-// ---------------------------------------------------------------------------
-// Database API Class
+// Database API Class (Direct PostgreSQL queries only)
 // ---------------------------------------------------------------------------
 export class Database {
+  /**
+   * Health Check: Verify PostgreSQL connection and return server metadata
+   */
+  static async testConnection(): Promise<{
+    connected: boolean;
+    database: string;
+    serverTime: string;
+    version: string;
+  }> {
+    const pool = getPool();
+    try {
+      const res = await pool.query(
+        'SELECT NOW() as db_time, current_database() as db_name, version() as pg_version;'
+      );
+      const row = res.rows[0];
+      return {
+        connected: true,
+        database: row.db_name,
+        serverTime: row.db_time.toISOString(),
+        version: row.pg_version,
+      };
+    } catch (err: any) {
+      throw new Error(`Database Connection Error: Failed to query PostgreSQL. ${err.message}`);
+    }
+  }
+
   // -------------------------
   // Rooms
   // -------------------------
   static async getRooms(): Promise<Room[]> {
-    return [...store.rooms].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const pool = getPool();
+    const res = await pool.query(
+      'SELECT id, name, location, capacity, amenities, is_active, created_at FROM rooms ORDER BY name;'
+    );
+    return res.rows.map((r) => ({
+      ...r,
+      created_at: new Date(r.created_at).toISOString(),
+    }));
   }
 
   static async getRoomById(id: string): Promise<Room | null> {
-    return store.rooms.find((r) => r.id === id) || null;
+    const pool = getPool();
+    const res = await pool.query(
+      'SELECT id, name, location, capacity, amenities, is_active, created_at FROM rooms WHERE id = $1;',
+      [id]
+    );
+    if (res.rows.length === 0) return null;
+    const r = res.rows[0];
+    return {
+      ...r,
+      created_at: new Date(r.created_at).toISOString(),
+    };
   }
 
   static async createRoom(data: Omit<Room, 'id' | 'created_at'>): Promise<Room> {
+    const pool = getPool();
+    const res = await pool.query(
+      `INSERT INTO rooms (name, location, capacity, amenities, is_active)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, location, capacity, amenities, is_active, created_at;`,
+      [data.name, data.location, data.capacity, data.amenities || [], data.is_active ?? true]
+    );
     const room: Room = {
-      ...data,
-      id: crypto.randomUUID(),
-      created_at: new Date().toISOString(),
+      ...res.rows[0],
+      created_at: new Date(res.rows[0].created_at).toISOString(),
     };
-    store.rooms.push(room);
     broadcastRealtimeEvent({ table: 'rooms', action: 'INSERT', data: room });
     return room;
   }
 
   static async updateRoom(id: string, updates: Partial<Room>): Promise<Room | null> {
-    const idx = store.rooms.findIndex((r) => r.id === id);
-    if (idx === -1) return null;
-    store.rooms[idx] = { ...store.rooms[idx], ...updates };
-    broadcastRealtimeEvent({ table: 'rooms', action: 'UPDATE', data: store.rooms[idx] });
-    return store.rooms[idx];
+    const pool = getPool();
+    const fields: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
+
+    if (updates.name !== undefined) {
+      fields.push(`name = $${idx++}`);
+      values.push(updates.name);
+    }
+    if (updates.location !== undefined) {
+      fields.push(`location = $${idx++}`);
+      values.push(updates.location);
+    }
+    if (updates.capacity !== undefined) {
+      fields.push(`capacity = $${idx++}`);
+      values.push(updates.capacity);
+    }
+    if (updates.amenities !== undefined) {
+      fields.push(`amenities = $${idx++}`);
+      values.push(updates.amenities);
+    }
+    if (updates.is_active !== undefined) {
+      fields.push(`is_active = $${idx++}`);
+      values.push(updates.is_active);
+    }
+
+    if (fields.length === 0) return await this.getRoomById(id);
+
+    values.push(id);
+    const sql = `UPDATE rooms SET ${fields.join(', ')} WHERE id = $${idx} RETURNING id, name, location, capacity, amenities, is_active, created_at;`;
+    const res = await pool.query(sql, values);
+    if (res.rows.length === 0) return null;
+
+    const updated: Room = {
+      ...res.rows[0],
+      created_at: new Date(res.rows[0].created_at).toISOString(),
+    };
+    broadcastRealtimeEvent({ table: 'rooms', action: 'UPDATE', data: updated });
+    return updated;
   }
 
-  static suggestNextRoomName(): string {
-    const numbers = store.rooms
-      .map((r) => {
+  static async suggestNextRoomName(): Promise<string> {
+    const pool = getPool();
+    const res = await pool.query('SELECT name FROM rooms;');
+    const numbers = res.rows
+      .map((r: { name: string }) => {
         const match = r.name.match(/Meeting Room (\d+)/i);
         return match ? parseInt(match[1], 10) : 0;
       })
-      .filter((n) => n > 0);
+      .filter((n: number) => n > 0);
     const max = numbers.length > 0 ? Math.max(...numbers) : 5;
     return `Meeting Room ${max + 1}`;
   }
@@ -318,28 +252,68 @@ export class Database {
   // Bookings
   // -------------------------
   static async getBookings(roomId?: string, dateStr?: string): Promise<Booking[]> {
-    let list = [...store.bookings];
+    const pool = getPool();
+    const conditions: string[] = [];
+    const params: any[] = [];
+    let idx = 1;
+
     if (roomId) {
-      list = list.filter((b) => b.room_id === roomId);
+      conditions.push(`room_id = $${idx++}`);
+      params.push(roomId);
     }
+
     if (dateStr) {
-      const dayStart = createDubaiDateTime(dateStr, 0, 0);
-      const dayEnd = createDubaiDateTime(dateStr, 23, 59);
-      list = list.filter((b) => {
-        const bStart = parseISO(b.start_time);
-        const bEnd = parseISO(b.end_time);
-        return isBefore(dayStart, bEnd) && isAfter(dayEnd, bStart);
-      });
+      const dayStart = createDubaiDateTime(dateStr, 0, 0).toISOString();
+      const dayEnd = createDubaiDateTime(dateStr, 23, 59).toISOString();
+      conditions.push(`start_time < $${idx++} AND end_time > $${idx++}`);
+      params.push(dayEnd, dayStart);
     }
-    return list.sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime());
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at
+                 FROM bookings ${where} ORDER BY start_time ASC;`;
+
+    const res = await pool.query(sql, params);
+    return res.rows.map((b) => ({
+      ...b,
+      start_time: new Date(b.start_time).toISOString(),
+      end_time: new Date(b.end_time).toISOString(),
+      created_at: new Date(b.created_at).toISOString(),
+    }));
   }
 
   static async getBookingById(id: string): Promise<Booking | null> {
-    return store.bookings.find((b) => b.id === id) || null;
+    const pool = getPool();
+    const res = await pool.query(
+      `SELECT id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at
+       FROM bookings WHERE id = $1;`,
+      [id]
+    );
+    if (res.rows.length === 0) return null;
+    const b = res.rows[0];
+    return {
+      ...b,
+      start_time: new Date(b.start_time).toISOString(),
+      end_time: new Date(b.end_time).toISOString(),
+      created_at: new Date(b.created_at).toISOString(),
+    };
   }
 
   static async getBookingByCancelToken(token: string): Promise<Booking | null> {
-    return store.bookings.find((b) => b.cancel_token === token) || null;
+    const pool = getPool();
+    const res = await pool.query(
+      `SELECT id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at
+       FROM bookings WHERE cancel_token = $1;`,
+      [token]
+    );
+    if (res.rows.length === 0) return null;
+    const b = res.rows[0];
+    return {
+      ...b,
+      start_time: new Date(b.start_time).toISOString(),
+      end_time: new Date(b.end_time).toISOString(),
+      created_at: new Date(b.created_at).toISOString(),
+    };
   }
 
   static async createBooking(dto: {
@@ -351,117 +325,181 @@ export class Database {
     end_time: string;
     notes?: string | null;
   }): Promise<Booking> {
+    const pool = getPool();
     const newStart = parseISO(dto.start_time);
     const newEnd = parseISO(dto.end_time);
 
-    // 1. Check if room is active
+    // 1. Verify room is active
     const room = await this.getRoomById(dto.room_id);
     if (!room || !room.is_active) {
       throw new Error('This meeting room is inactive and cannot be booked.');
     }
 
-    // 2. Check if slot overlaps with any blocked slot
-    const blocked = await this.getBlockedSlots(dto.room_id);
-    const isBlocked = blocked.some((block) => {
+    // 2. Check blocked slot conflict
+    const blockedRes = await pool.query(
+      `SELECT * FROM blocked_slots
+       WHERE (room_id IS NULL OR room_id = $1)
+         AND start_time < $3 AND end_time > $2;`,
+      [dto.room_id, dto.start_time, dto.end_time]
+    );
+
+    const hasBlock = blockedRes.rows.some((block: any) => {
       if (block.recurring_rule === 'FRIDAY_12_14') {
         const day = formatInDubai(newStart, 'EEEE');
         const h = parseInt(formatInDubai(newStart, 'H'), 10);
         if (day === 'Friday' && h >= 12 && h < 14) return true;
       }
-      const bStart = parseISO(block.start_time);
-      const bEnd = parseISO(block.end_time);
-      return isBefore(newStart, bEnd) && isAfter(newEnd, bStart);
+      return true;
     });
 
-    if (isBlocked) {
+    if (hasBlock) {
       const err = new Error('This time slot is blocked and unavailable for booking.');
       (err as any).code = 'SLOT_BLOCKED';
       throw err;
     }
 
-    // 3. Check database-level exclusion overlap constraint
-    const confirmedBookings = store.bookings.filter(
-      (b) => b.room_id === dto.room_id && b.status === 'confirmed'
-    );
+    // 3. Insert into PostgreSQL (enforcing exclusion constraint no_overlapping_confirmed_bookings)
+    const cancelToken = crypto.randomBytes(16).toString('hex');
+    try {
+      const res = await pool.query(
+        `INSERT INTO bookings (room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'confirmed')
+         RETURNING id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at;`,
+        [
+          dto.room_id,
+          dto.title,
+          dto.organizer_name,
+          dto.organizer_email,
+          dto.start_time,
+          dto.end_time,
+          dto.notes || null,
+          cancelToken,
+        ]
+      );
 
-    const hasOverlap = confirmedBookings.some((b) => {
-      const bStart = parseISO(b.start_time);
-      const bEnd = parseISO(b.end_time);
-      return isBefore(newStart, bEnd) && isAfter(newEnd, bStart);
-    });
+      const booking: Booking = {
+        ...res.rows[0],
+        start_time: new Date(res.rows[0].start_time).toISOString(),
+        end_time: new Date(res.rows[0].end_time).toISOString(),
+        created_at: new Date(res.rows[0].created_at).toISOString(),
+      };
 
-    if (hasOverlap) {
-      const err = new Error('This slot was just taken, please pick another.');
-      (err as any).code = '23P01'; // Matches Postgres exclusion violation
+      broadcastRealtimeEvent({ table: 'bookings', action: 'INSERT', data: booking });
+      return booking;
+    } catch (err: any) {
+      // PostgreSQL 23P01 is exclusion_violation
+      if (err.code === '23P01' || err.message?.includes('no_overlapping_confirmed_bookings')) {
+        const error = new Error('This slot was just taken, please pick another.');
+        (error as any).code = '23P01';
+        throw error;
+      }
       throw err;
     }
-
-    const booking: Booking = {
-      id: crypto.randomUUID(),
-      room_id: dto.room_id,
-      title: dto.title,
-      organizer_name: dto.organizer_name,
-      organizer_email: dto.organizer_email,
-      start_time: dto.start_time,
-      end_time: dto.end_time,
-      notes: dto.notes || null,
-      cancel_token: crypto.randomBytes(16).toString('hex'),
-      status: 'confirmed',
-      created_at: new Date().toISOString(),
-    };
-
-    store.bookings.push(booking);
-    broadcastRealtimeEvent({ table: 'bookings', action: 'INSERT', data: booking });
-    return booking;
   }
 
   static async updateBooking(id: string, updates: Partial<Booking>): Promise<Booking | null> {
-    const idx = store.bookings.findIndex((b) => b.id === id);
-    if (idx === -1) return null;
+    const pool = getPool();
+    const fields: string[] = [];
+    const values: any[] = [];
+    let idx = 1;
 
-    // If changing time or room, verify overlap
-    if ((updates.start_time || updates.end_time || updates.room_id) && updates.status !== 'cancelled') {
-      const newRoom = updates.room_id || store.bookings[idx].room_id;
-      const newStart = parseISO(updates.start_time || store.bookings[idx].start_time);
-      const newEnd = parseISO(updates.end_time || store.bookings[idx].end_time);
-
-      const conflicts = store.bookings.filter(
-        (b) => b.id !== id && b.room_id === newRoom && b.status === 'confirmed'
-      );
-      const hasOverlap = conflicts.some((b) => {
-        const bStart = parseISO(b.start_time);
-        const bEnd = parseISO(b.end_time);
-        return isBefore(newStart, bEnd) && isAfter(newEnd, bStart);
-      });
-
-      if (hasOverlap) {
-        const err = new Error('The updated time slot overlaps with an existing booking.');
-        (err as any).code = '23P01';
-        throw err;
-      }
+    if (updates.title !== undefined) {
+      fields.push(`title = $${idx++}`);
+      values.push(updates.title);
+    }
+    if (updates.organizer_name !== undefined) {
+      fields.push(`organizer_name = $${idx++}`);
+      values.push(updates.organizer_name);
+    }
+    if (updates.organizer_email !== undefined) {
+      fields.push(`organizer_email = $${idx++}`);
+      values.push(updates.organizer_email);
+    }
+    if (updates.start_time !== undefined) {
+      fields.push(`start_time = $${idx++}`);
+      values.push(updates.start_time);
+    }
+    if (updates.end_time !== undefined) {
+      fields.push(`end_time = $${idx++}`);
+      values.push(updates.end_time);
+    }
+    if (updates.notes !== undefined) {
+      fields.push(`notes = $${idx++}`);
+      values.push(updates.notes);
+    }
+    if (updates.room_id !== undefined) {
+      fields.push(`room_id = $${idx++}`);
+      values.push(updates.room_id);
+    }
+    if (updates.status !== undefined) {
+      fields.push(`status = $${idx++}`);
+      values.push(updates.status);
     }
 
-    store.bookings[idx] = { ...store.bookings[idx], ...updates };
-    broadcastRealtimeEvent({ table: 'bookings', action: 'UPDATE', data: store.bookings[idx] });
-    return store.bookings[idx];
+    if (fields.length === 0) return await this.getBookingById(id);
+
+    values.push(id);
+    const sql = `UPDATE bookings SET ${fields.join(', ')} WHERE id = $${idx}
+                 RETURNING id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at;`;
+
+    try {
+      const res = await pool.query(sql, values);
+      if (res.rows.length === 0) return null;
+
+      const booking: Booking = {
+        ...res.rows[0],
+        start_time: new Date(res.rows[0].start_time).toISOString(),
+        end_time: new Date(res.rows[0].end_time).toISOString(),
+        created_at: new Date(res.rows[0].created_at).toISOString(),
+      };
+      broadcastRealtimeEvent({ table: 'bookings', action: 'UPDATE', data: booking });
+      return booking;
+    } catch (err: any) {
+      if (err.code === '23P01' || err.message?.includes('no_overlapping_confirmed_bookings')) {
+        const error = new Error('The updated time slot overlaps with an existing booking.');
+        (error as any).code = '23P01';
+        throw error;
+      }
+      throw err;
+    }
   }
 
   static async cancelBookingByToken(token: string): Promise<Booking> {
-    const booking = store.bookings.find((b) => b.cancel_token === token);
-    if (!booking) {
+    const pool = getPool();
+    const res = await pool.query(
+      `UPDATE bookings SET status = 'cancelled' WHERE cancel_token = $1
+       RETURNING id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at;`,
+      [token]
+    );
+    if (res.rows.length === 0) {
       throw new Error('Invalid cancellation token or booking not found.');
     }
-    booking.status = 'cancelled';
+    const booking: Booking = {
+      ...res.rows[0],
+      start_time: new Date(res.rows[0].start_time).toISOString(),
+      end_time: new Date(res.rows[0].end_time).toISOString(),
+      created_at: new Date(res.rows[0].created_at).toISOString(),
+    };
     broadcastRealtimeEvent({ table: 'bookings', action: 'UPDATE', data: booking });
     return booking;
   }
 
   static async adminCancelBooking(id: string): Promise<Booking> {
-    const booking = store.bookings.find((b) => b.id === id);
-    if (!booking) {
+    const pool = getPool();
+    const res = await pool.query(
+      `UPDATE bookings SET status = 'cancelled' WHERE id = $1
+       RETURNING id, room_id, title, organizer_name, organizer_email, start_time, end_time, notes, cancel_token, status, created_at;`,
+      [id]
+    );
+    if (res.rows.length === 0) {
       throw new Error('Booking not found.');
     }
-    booking.status = 'cancelled';
+    const booking: Booking = {
+      ...res.rows[0],
+      start_time: new Date(res.rows[0].start_time).toISOString(),
+      end_time: new Date(res.rows[0].end_time).toISOString(),
+      created_at: new Date(res.rows[0].created_at).toISOString(),
+    };
     broadcastRealtimeEvent({ table: 'bookings', action: 'UPDATE', data: booking });
     return booking;
   }
@@ -470,11 +508,20 @@ export class Database {
   // Blocked Slots
   // -------------------------
   static async getBlockedSlots(roomId?: string): Promise<BlockedSlot[]> {
-    let list = [...store.blockedSlots];
+    const pool = getPool();
+    let sql = 'SELECT * FROM blocked_slots ORDER BY start_time ASC;';
+    const params: any[] = [];
     if (roomId) {
-      list = list.filter((b) => b.room_id === null || b.room_id === roomId);
+      sql = 'SELECT * FROM blocked_slots WHERE room_id IS NULL OR room_id = $1 ORDER BY start_time ASC;';
+      params.push(roomId);
     }
-    return list;
+    const res = await pool.query(sql, params);
+    return res.rows.map((b) => ({
+      ...b,
+      start_time: new Date(b.start_time).toISOString(),
+      end_time: new Date(b.end_time).toISOString(),
+      created_at: new Date(b.created_at).toISOString(),
+    }));
   }
 
   static async createBlockedSlot(dto: {
@@ -485,39 +532,47 @@ export class Database {
     end_time: string;
     recurring_rule?: string | null;
   }): Promise<{ blockedSlot: BlockedSlot; affectedBookingsCount: number }> {
-    const newStart = parseISO(dto.start_time);
-    const newEnd = parseISO(dto.end_time);
+    const pool = getPool();
 
-    // Find if any confirmed bookings will be affected
-    const affected = store.bookings.filter((b) => {
-      if (b.status !== 'confirmed') return false;
-      if (dto.room_id && b.room_id !== dto.room_id) return false;
-      const bStart = parseISO(b.start_time);
-      const bEnd = parseISO(b.end_time);
-      return isBefore(newStart, bEnd) && isAfter(newEnd, bStart);
-    });
+    // Check affected confirmed bookings
+    const countRes = await pool.query(
+      `SELECT count(*) FROM bookings
+       WHERE ($1::uuid IS NULL OR room_id = $1::uuid)
+         AND status = 'confirmed'
+         AND start_time < $3 AND end_time > $2;`,
+      [dto.room_id || null, dto.start_time, dto.end_time]
+    );
+    const affectedCount = parseInt(countRes.rows[0].count, 10);
+
+    const res = await pool.query(
+      `INSERT INTO blocked_slots (room_id, title, reason, start_time, end_time, recurring_rule, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, 'admin')
+       RETURNING id, room_id, title, reason, start_time, end_time, recurring_rule, created_by, created_at;`,
+      [
+        dto.room_id || null,
+        dto.title,
+        dto.reason || null,
+        dto.start_time,
+        dto.end_time,
+        dto.recurring_rule || null,
+      ]
+    );
 
     const blocked: BlockedSlot = {
-      id: crypto.randomUUID(),
-      room_id: dto.room_id || null,
-      title: dto.title,
-      reason: dto.reason || null,
-      start_time: dto.start_time,
-      end_time: dto.end_time,
-      recurring_rule: dto.recurring_rule || null,
-      created_by: 'admin',
-      created_at: new Date().toISOString(),
+      ...res.rows[0],
+      start_time: new Date(res.rows[0].start_time).toISOString(),
+      end_time: new Date(res.rows[0].end_time).toISOString(),
+      created_at: new Date(res.rows[0].created_at).toISOString(),
     };
 
-    store.blockedSlots.push(blocked);
     broadcastRealtimeEvent({ table: 'blocked_slots', action: 'INSERT', data: blocked });
-    return { blockedSlot: blocked, affectedBookingsCount: affected.length };
+    return { blockedSlot: blocked, affectedBookingsCount: affectedCount };
   }
 
   static async deleteBlockedSlot(id: string): Promise<boolean> {
-    const idx = store.blockedSlots.findIndex((b) => b.id === id);
-    if (idx === -1) return false;
-    store.blockedSlots.splice(idx, 1);
+    const pool = getPool();
+    const res = await pool.query('DELETE FROM blocked_slots WHERE id = $1 RETURNING id;', [id]);
+    if (res.rows.length === 0) return false;
     broadcastRealtimeEvent({ table: 'blocked_slots', action: 'DELETE', id });
     return true;
   }
@@ -526,17 +581,31 @@ export class Database {
   // Display Screens
   // -------------------------
   static async getDisplayScreens(): Promise<DisplayScreen[]> {
+    const pool = getPool();
+    const res = await pool.query('SELECT * FROM display_screens ORDER BY name;');
     const now = Date.now();
-    return store.displayScreens.map((s) => {
+    return res.rows.map((s) => {
       const last = s.last_heartbeat_at ? new Date(s.last_heartbeat_at).getTime() : 0;
-      const isOnline = now - last < 90000; // online if heartbeat within 90s
-      return { ...s, is_online: isOnline };
+      const isOnline = now - last < 90000;
+      return {
+        ...s,
+        is_online: isOnline,
+        last_heartbeat_at: s.last_heartbeat_at ? new Date(s.last_heartbeat_at).toISOString() : null,
+        created_at: new Date(s.created_at).toISOString(),
+      };
     });
   }
 
   static async getDisplayScreenByToken(token: string): Promise<DisplayScreen | null> {
-    const screen = store.displayScreens.find((s) => s.display_token === token);
-    return screen || null;
+    const pool = getPool();
+    const res = await pool.query('SELECT * FROM display_screens WHERE display_token = $1;', [token]);
+    if (res.rows.length === 0) return null;
+    const s = res.rows[0];
+    return {
+      ...s,
+      last_heartbeat_at: s.last_heartbeat_at ? new Date(s.last_heartbeat_at).toISOString() : null,
+      created_at: new Date(s.created_at).toISOString(),
+    };
   }
 
   static async registerDisplayScreen(data: {
@@ -545,145 +614,221 @@ export class Database {
     media_player_ip?: string | null;
     orientation: 'landscape' | 'portrait';
   }): Promise<DisplayScreen> {
+    const pool = getPool();
+    const token = crypto.randomBytes(16).toString('hex');
+    const res = await pool.query(
+      `INSERT INTO display_screens (name, room_id, media_player_ip, orientation, display_token, last_heartbeat_at, reload_requested)
+       VALUES ($1, $2, $3, $4, $5, NOW(), FALSE)
+       RETURNING *;`,
+      [data.name, data.room_id, data.media_player_ip || null, data.orientation, token]
+    );
+
     const screen: DisplayScreen = {
-      id: crypto.randomUUID(),
-      name: data.name,
-      room_id: data.room_id,
-      media_player_ip: data.media_player_ip || null,
-      orientation: data.orientation,
-      display_token: crypto.randomBytes(16).toString('hex'),
-      last_heartbeat_at: new Date().toISOString(),
+      ...res.rows[0],
       is_online: true,
-      reload_requested: false,
-      created_at: new Date().toISOString(),
+      last_heartbeat_at: new Date().toISOString(),
+      created_at: new Date(res.rows[0].created_at).toISOString(),
     };
-    store.displayScreens.push(screen);
     broadcastRealtimeEvent({ table: 'screens', action: 'INSERT', data: screen });
     return screen;
   }
 
   static async recordScreenHeartbeat(token: string, ip?: string): Promise<boolean> {
-    const screen = store.displayScreens.find((s) => s.display_token === token);
-    if (!screen) return false;
-    screen.last_heartbeat_at = new Date().toISOString();
-    if (ip && !screen.media_player_ip) {
-      screen.media_player_ip = ip;
+    const pool = getPool();
+    const res = await pool.query(
+      `UPDATE display_screens
+       SET last_heartbeat_at = NOW(),
+           media_player_ip = COALESCE(media_player_ip, $2)
+       WHERE display_token = $1
+       RETURNING reload_requested;`,
+      [token, ip || null]
+    );
+    if (res.rows.length === 0) return false;
+    const reload = res.rows[0].reload_requested;
+    if (reload) {
+      await pool.query('UPDATE display_screens SET reload_requested = FALSE WHERE display_token = $1;', [token]);
     }
-    const shouldReload = !!screen.reload_requested;
-    if (shouldReload) screen.reload_requested = false;
-    return shouldReload;
+    return reload;
   }
 
   static async requestScreenReload(screenId: string): Promise<boolean> {
-    const screen = store.displayScreens.find((s) => s.id === screenId);
-    if (!screen) return false;
-    screen.reload_requested = true;
+    const pool = getPool();
+    const res = await pool.query(
+      'UPDATE display_screens SET reload_requested = TRUE WHERE id = $1 RETURNING id;',
+      [screenId]
+    );
+    if (res.rows.length === 0) return false;
     broadcastRealtimeEvent({ table: 'screens', action: 'RELOAD', id: screenId });
     return true;
   }
 
   static async regenerateDisplayToken(screenId: string): Promise<string | null> {
-    const screen = store.displayScreens.find((s) => s.id === screenId);
-    if (!screen) return null;
-    screen.display_token = crypto.randomBytes(16).toString('hex');
-    broadcastRealtimeEvent({ table: 'screens', action: 'UPDATE', data: screen });
-    return screen.display_token;
+    const pool = getPool();
+    const newToken = crypto.randomBytes(16).toString('hex');
+    const res = await pool.query(
+      'UPDATE display_screens SET display_token = $1 WHERE id = $2 RETURNING display_token;',
+      [newToken, screenId]
+    );
+    if (res.rows.length === 0) return null;
+    return newToken;
   }
 
   // -------------------------
-  // Admin Authentication & Security
+  // Admin User & Authentication (Table: admin_user)
   // -------------------------
-  static async getAdminUser(): Promise<AdminUser | null> {
-    return store.adminUser;
+  static async getAdminUser(username = 'admin'): Promise<AdminUser | null> {
+    const pool = getPool();
+    const res = await pool.query(
+      'SELECT id, username, password_hash, pin_hash, failed_attempts, locked_until, created_at, updated_at FROM admin_user WHERE username = $1 LIMIT 1;',
+      [username]
+    );
+    if (res.rows.length === 0) return null;
+    const u = res.rows[0];
+    return {
+      ...u,
+      locked_until: u.locked_until ? new Date(u.locked_until).toISOString() : null,
+      created_at: new Date(u.created_at).toISOString(),
+      updated_at: new Date(u.updated_at).toISOString(),
+    };
   }
 
-  static async recordFailedLogin(ip: string): Promise<{ locked: boolean; minutesRemaining?: number }> {
-    if (!store.adminUser) return { locked: false };
-    store.adminUser.failed_attempts += 1;
+  static async createOrUpdateAdminUser(
+    username: string,
+    passwordHash: string,
+    pinHash: string
+  ): Promise<AdminUser> {
+    const pool = getPool();
+    const res = await pool.query(
+      `INSERT INTO admin_user (username, password_hash, pin_hash, failed_attempts, locked_until)
+       VALUES ($1, $2, $3, 0, NULL)
+       ON CONFLICT (username) DO UPDATE SET
+         password_hash = EXCLUDED.password_hash,
+         pin_hash = EXCLUDED.pin_hash,
+         failed_attempts = 0,
+         locked_until = NULL,
+         updated_at = NOW()
+       RETURNING id, username, password_hash, pin_hash, failed_attempts, locked_until, created_at, updated_at;`,
+      [username, passwordHash, pinHash]
+    );
+    const u = res.rows[0];
+    return {
+      ...u,
+      locked_until: null,
+      created_at: new Date(u.created_at).toISOString(),
+      updated_at: new Date(u.updated_at).toISOString(),
+    };
+  }
 
-    if (store.adminUser.failed_attempts >= 5) {
-      const lockUntil = new Date(Date.now() + 15 * 60 * 1000);
-      store.adminUser.locked_until = lockUntil.toISOString();
-      await this.logAudit('ADMIN_LOCKED_OUT', 'system', ip, {
+  static async recordFailedLogin(
+    ip: string,
+    username = 'admin'
+  ): Promise<{ locked: boolean; minutesRemaining?: number }> {
+    const pool = getPool();
+    const res = await pool.query(
+      `UPDATE admin_user
+       SET failed_attempts = failed_attempts + 1,
+           locked_until = CASE WHEN failed_attempts + 1 >= 5 THEN NOW() + INTERVAL '15 minutes' ELSE locked_until END,
+           updated_at = NOW()
+       WHERE username = $1
+       RETURNING failed_attempts, locked_until;`,
+      [username]
+    );
+
+    if (res.rows.length === 0) return { locked: false };
+    const { failed_attempts, locked_until } = res.rows[0];
+
+    if (failed_attempts >= 5 && locked_until) {
+      await this.logAudit('ADMIN_LOCKED_OUT', username, ip, {
         reason: '5 consecutive failed password attempts',
-        locked_until: lockUntil.toISOString(),
+        locked_until: new Date(locked_until).toISOString(),
       });
       return { locked: true, minutesRemaining: 15 };
     }
 
-    await this.logAudit('LOGIN_FAILED', 'admin', ip, {
-      attempt: store.adminUser.failed_attempts,
-    });
-
+    await this.logAudit('LOGIN_FAILED', username, ip, { attempt: failed_attempts });
     return { locked: false };
   }
 
-  static async resetFailedLogin(): Promise<void> {
-    if (store.adminUser) {
-      store.adminUser.failed_attempts = 0;
-      store.adminUser.locked_until = null;
-    }
+  static async resetFailedLogin(username = 'admin'): Promise<void> {
+    const pool = getPool();
+    await pool.query(
+      'UPDATE admin_user SET failed_attempts = 0, locked_until = NULL, updated_at = NOW() WHERE username = $1;',
+      [username]
+    );
   }
 
-  static async createAdminSession(ip?: string, userAgent?: string): Promise<AdminSession> {
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days sliding
-    const session: AdminSession = {
-      id: crypto.randomUUID(),
-      token,
-      expires_at: expiresAt.toISOString(),
-      last_activity_at: new Date().toISOString(),
-      ip_address: ip,
-      user_agent: userAgent,
-      created_at: new Date().toISOString(),
-    };
-    store.sessions.push(session);
-    return session;
+  static async updateAdminPassword(newPasswordHash: string, username = 'admin'): Promise<void> {
+    const pool = getPool();
+    await pool.query(
+      'UPDATE admin_user SET password_hash = $1, updated_at = NOW() WHERE username = $2;',
+      [newPasswordHash, username]
+    );
   }
 
-  static async verifyAdminSession(token: string): Promise<AdminSession | null> {
-    const session = store.sessions.find((s) => s.token === token);
-    if (!session) return null;
-
-    if (new Date(session.expires_at) < new Date()) {
-      // Expired
-      this.deleteAdminSession(token);
-      return null;
-    }
-
-    // Sliding renewal (update last_activity)
-    session.last_activity_at = new Date().toISOString();
-    return session;
+  static async updateAdminPin(newPinHash: string, username = 'admin'): Promise<void> {
+    const pool = getPool();
+    await pool.query(
+      'UPDATE admin_user SET pin_hash = $1, updated_at = NOW() WHERE username = $2;',
+      [newPinHash, username]
+    );
   }
 
-  static async deleteAdminSession(token: string): Promise<void> {
-    const idx = store.sessions.findIndex((s) => s.token === token);
-    if (idx !== -1) {
-      store.sessions.splice(idx, 1);
-    }
-  }
-
-  static async verifyAdminPin(pin: string): Promise<boolean> {
-    if (!store.adminUser || !store.adminUser.pin_hash) return false;
-    return bcrypt.compareSync(pin, store.adminUser.pin_hash);
-  }
-
-  static async updateAdminPassword(newPasswordHash: string): Promise<void> {
-    if (store.adminUser) {
-      store.adminUser.password_hash = newPasswordHash;
-      store.adminUser.updated_at = new Date().toISOString();
-    }
-  }
-
-  static async updateAdminPin(newPinHash: string): Promise<void> {
-    if (store.adminUser) {
-      store.adminUser.pin_hash = newPinHash;
-      store.adminUser.updated_at = new Date().toISOString();
-    }
+  static async verifyAdminPin(pin: string, username = 'admin'): Promise<boolean> {
+    const user = await this.getAdminUser(username);
+    if (!user || !user.pin_hash) return false;
+    return bcrypt.compareSync(pin, user.pin_hash);
   }
 
   // -------------------------
-  // Audit Logs
+  // Admin Sessions (Table: admin_sessions)
+  // -------------------------
+  static async createAdminSession(ip?: string, userAgent?: string): Promise<AdminSession> {
+    const pool = getPool();
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days sliding
+
+    const res = await pool.query(
+      `INSERT INTO admin_sessions (token, expires_at, ip_address, user_agent)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, token, expires_at, last_activity_at, ip_address, user_agent, created_at;`,
+      [token, expiresAt.toISOString(), ip || null, userAgent || null]
+    );
+
+    const s = res.rows[0];
+    return {
+      ...s,
+      expires_at: new Date(s.expires_at).toISOString(),
+      last_activity_at: new Date(s.last_activity_at).toISOString(),
+      created_at: new Date(s.created_at).toISOString(),
+    };
+  }
+
+  static async verifyAdminSession(token: string): Promise<AdminSession | null> {
+    const pool = getPool();
+    const res = await pool.query(
+      `UPDATE admin_sessions
+       SET last_activity_at = NOW()
+       WHERE token = $1 AND expires_at > NOW()
+       RETURNING id, token, expires_at, last_activity_at, ip_address, user_agent, created_at;`,
+      [token]
+    );
+    if (res.rows.length === 0) return null;
+    const s = res.rows[0];
+    return {
+      ...s,
+      expires_at: new Date(s.expires_at).toISOString(),
+      last_activity_at: new Date(s.last_activity_at).toISOString(),
+      created_at: new Date(s.created_at).toISOString(),
+    };
+  }
+
+  static async deleteAdminSession(token: string): Promise<void> {
+    const pool = getPool();
+    await pool.query('DELETE FROM admin_sessions WHERE token = $1;', [token]);
+  }
+
+  // -------------------------
+  // Audit Logs (Table: audit_logs)
   // -------------------------
   static async logAudit(
     action: string,
@@ -691,41 +836,91 @@ export class Database {
     ip_address: string,
     details?: Record<string, any> | string
   ): Promise<AuditLog> {
-    const log: AuditLog = {
-      id: crypto.randomUUID(),
-      action,
-      actor,
-      ip_address,
-      details: details || null,
-      created_at: new Date().toISOString(),
+    const pool = getPool();
+    const res = await pool.query(
+      `INSERT INTO audit_logs (action, actor, ip_address, details)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, action, actor, ip_address, details, created_at;`,
+      [action, actor, ip_address, typeof details === 'string' ? JSON.stringify({ message: details }) : details || null]
+    );
+    const log = res.rows[0];
+    return {
+      ...log,
+      created_at: new Date(log.created_at).toISOString(),
     };
-    store.auditLogs.unshift(log);
-    // Retain up to 1000 logs in memory
-    if (store.auditLogs.length > 1000) {
-      store.auditLogs.pop();
-    }
-    return log;
   }
 
   static async getAuditLogs(limit = 100): Promise<AuditLog[]> {
-    return store.auditLogs.slice(0, limit);
+    const pool = getPool();
+    const res = await pool.query(
+      'SELECT id, action, actor, ip_address, details, created_at FROM audit_logs ORDER BY created_at DESC LIMIT $1;',
+      [limit]
+    );
+    return res.rows.map((log) => ({
+      ...log,
+      created_at: new Date(log.created_at).toISOString(),
+    }));
   }
 
   // -------------------------
-  // Settings
+  // App Settings (Table: app_settings)
   // -------------------------
   static async getSettings(): Promise<AppSettings> {
-    return { ...store.settings };
+    const pool = getPool();
+    const res = await pool.query(
+      'SELECT work_start_hour, work_end_hour, slot_duration_minutes, max_booking_duration_hours, max_advance_booking_days, privacy_mode, inactivity_lock_minutes FROM app_settings WHERE id = 1;'
+    );
+    if (res.rows.length === 0) {
+      return { ...DEFAULT_SETTINGS };
+    }
+    return res.rows[0];
   }
 
   static async updateSettings(updates: Partial<AppSettings>): Promise<AppSettings> {
-    store.settings = { ...store.settings, ...updates };
-    broadcastRealtimeEvent({ table: 'settings', action: 'UPDATE', data: store.settings });
-    return { ...store.settings };
+    const pool = getPool();
+    const fields: string[] = ['updated_at = NOW()'];
+    const values: any[] = [];
+    let idx = 1;
+
+    if (updates.work_start_hour !== undefined) {
+      fields.push(`work_start_hour = $${idx++}`);
+      values.push(updates.work_start_hour);
+    }
+    if (updates.work_end_hour !== undefined) {
+      fields.push(`work_end_hour = $${idx++}`);
+      values.push(updates.work_end_hour);
+    }
+    if (updates.slot_duration_minutes !== undefined) {
+      fields.push(`slot_duration_minutes = $${idx++}`);
+      values.push(updates.slot_duration_minutes);
+    }
+    if (updates.max_booking_duration_hours !== undefined) {
+      fields.push(`max_booking_duration_hours = $${idx++}`);
+      values.push(updates.max_booking_duration_hours);
+    }
+    if (updates.max_advance_booking_days !== undefined) {
+      fields.push(`max_advance_booking_days = $${idx++}`);
+      values.push(updates.max_advance_booking_days);
+    }
+    if (updates.privacy_mode !== undefined) {
+      fields.push(`privacy_mode = $${idx++}`);
+      values.push(updates.privacy_mode);
+    }
+    if (updates.inactivity_lock_minutes !== undefined) {
+      fields.push(`inactivity_lock_minutes = $${idx++}`);
+      values.push(updates.inactivity_lock_minutes);
+    }
+
+    const sql = `UPDATE app_settings SET ${fields.join(', ')} WHERE id = 1
+                 RETURNING work_start_hour, work_end_hour, slot_duration_minutes, max_booking_duration_hours, max_advance_booking_days, privacy_mode, inactivity_lock_minutes;`;
+    const res = await pool.query(sql, values);
+    const updated = res.rows[0];
+    broadcastRealtimeEvent({ table: 'settings', action: 'UPDATE', data: updated });
+    return updated;
   }
 
   // -------------------------
-  // Admin Dashboard Overview Stats
+  // Dashboard Overview
   // -------------------------
   static async getDashboardOverview() {
     const rooms = await this.getRooms();
