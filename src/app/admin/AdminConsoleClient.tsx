@@ -9,8 +9,6 @@ import {
   DoorClosed,
   ShieldBan,
   Tv,
-  QrCode,
-  ScrollText,
   Settings,
   Lock,
   LogOut,
@@ -18,7 +16,6 @@ import {
   Trash2,
   Edit2,
   RefreshCw,
-  Printer,
   CheckCircle2,
   Clock,
   MapPin,
@@ -26,18 +23,17 @@ import {
   Search,
   ExternalLink,
   ChevronRight,
-  ShieldAlert,
   ArrowRight,
-  Eye,
-  EyeOff,
+  ChevronLeft,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Modal } from '@/components/ui/modal';
-import { Room, Booking, BlockedSlot, DisplayScreen, AuditLog, AppSettings } from '@/types';
-import { formatInDubai } from '@/lib/timezone';
+import { Room, Booking, BlockedSlot, DisplayScreen, AppSettings } from '@/types';
+import { formatInDubai, isOverlappingDubaiDay, getDubaiNowLinePercentage } from '@/lib/timezone';
 import Link from 'next/link';
+import { parseISO } from 'date-fns';
 
 interface AdminConsoleProps {
   initialRooms: Room[];
@@ -51,14 +47,14 @@ type TabKey =
   | 'rooms'
   | 'blocks'
   | 'screens'
-  | 'qrcodes'
-  | 'audit'
   | 'settings';
+
+const HOURS_LIST = [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
 
 export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConsoleProps) {
   const router = useRouter();
 
-  // Navigation State
+  // Navigation State (Audit Log and QR Signs removed per Change 2 & 3)
   const [activeTab, setActiveTab] = React.useState<TabKey>('dashboard');
 
   // Inactivity & PIN Quick-Lock State
@@ -72,13 +68,22 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
   const [bookings, setBookings] = React.useState<Booking[]>([]);
   const [blockedSlots, setBlockedSlots] = React.useState<BlockedSlot[]>([]);
   const [screens, setScreens] = React.useState<DisplayScreen[]>([]);
-  const [auditLogs, setAuditLogs] = React.useState<AuditLog[]>([]);
   const [settings, setSettings] = React.useState<AppSettings>(initialSettings);
   const [stats, setStats] = React.useState<any>(null);
 
-  // Filter States
+  // Today's Schedule Date Navigation (Change 1)
+  const [scheduleDate, setScheduleDate] = React.useState<string>(() =>
+    formatInDubai(new Date(), 'yyyy-MM-dd')
+  );
+
+  // Pagination states for zero page scrolling (Change 4)
+  const [bookingPage, setBookingPage] = React.useState(1);
   const [bookingFilterRoom, setBookingFilterRoom] = React.useState<string>('ALL');
   const [bookingSearch, setBookingSearch] = React.useState<string>('');
+  const BOOKINGS_PAGE_SIZE = 7;
+
+  const [blocksPage, setBlocksPage] = React.useState(1);
+  const BLOCKS_PAGE_SIZE = 6;
 
   // Modals
   const [showAddRoomModal, setShowAddRoomModal] = React.useState(false);
@@ -113,62 +118,24 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         fetch('/api/blocks'),
         fetch('/api/screens'),
         fetch('/api/settings'),
-        fetch('/api/stats'),
+        fetch(`/api/stats?date=${scheduleDate}`),
       ]);
 
-      if (rRes.ok) {
-        const d = await rRes.json();
-        setRooms(d.rooms);
-      }
-      if (bRes.ok) {
-        const d = await bRes.json();
-        setBookings(d.bookings);
-      }
-      if (blRes.ok) {
-        const d = await blRes.json();
-        setBlockedSlots(d.blocks);
-      }
-      if (scRes.ok) {
-        const d = await scRes.json();
-        setScreens(d.screens);
-      }
-      if (sRes.ok) {
-        const d = await sRes.json();
-        setSettings(d.settings);
-      }
-      if (stRes.ok) {
-        const d = await stRes.json();
-        setStats(d);
-      }
+      if (rRes.ok) setRooms((await rRes.json()).rooms || []);
+      if (bRes.ok) setBookings((await bRes.json()).bookings || []);
+      if (blRes.ok) setBlockedSlots((await blRes.json()).blocks || []);
+      if (scRes.ok) setScreens((await scRes.json()).screens || []);
+      if (sRes.ok) setSettings((await sRes.json()).settings || initialSettings);
+      if (stRes.ok) setStats(await stRes.json());
     } catch (e) {
       console.error('Error fetching admin data', e);
     }
-  }, []);
+  }, [initialSettings, scheduleDate]);
 
-  const fetchAuditLogs = async () => {
-    try {
-      const res = await fetch('/api/audit');
-      if (res.ok) {
-        const d = await res.json();
-        setAuditLogs(d.logs);
-      }
-    } catch (e) {
-      console.error('Error fetching audit logs', e);
-    }
-  };
-
+  // Initial fetch and Realtime SSE listener
   React.useEffect(() => {
     fetchAllData();
-  }, [fetchAllData]);
 
-  React.useEffect(() => {
-    if (activeTab === 'audit') {
-      fetchAuditLogs();
-    }
-  }, [activeTab]);
-
-  // Real-time SSE listener
-  React.useEffect(() => {
     let es: EventSource | null = null;
     try {
       es = new EventSource('/api/realtime');
@@ -177,24 +144,41 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
       es.addEventListener('rooms', () => fetchAllData());
       es.addEventListener('screens', () => fetchAllData());
       es.addEventListener('settings', () => fetchAllData());
-    } catch (e) {
-      // Ignored
+    } catch (err) {
+      console.warn('Realtime event source init error', err);
     }
+
     return () => {
       if (es) es.close();
     };
   }, [fetchAllData]);
 
-  // Inactivity Timer (15 minutes)
+  // Day rollover at midnight Dubai time without reload (Change 1)
   React.useEffect(() => {
-    let timeout: NodeJS.Timeout;
-    const lockMinutes = settings.inactivity_lock_minutes || 15;
+    const checkMidnight = () => {
+      const todayDubai = formatInDubai(new Date(), 'yyyy-MM-dd');
+      setScheduleDate((prev) => {
+        // Automatically advance if viewing yesterday's date
+        if (prev < todayDubai) {
+          return todayDubai;
+        }
+        return prev;
+      });
+    };
+    const interval = setInterval(checkMidnight, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Inactivity Auto-Lock Timer
+  React.useEffect(() => {
+    const timeoutMs = (settings.inactivity_lock_minutes || 15) * 60 * 1000;
+    let timer: NodeJS.Timeout;
 
     const resetTimer = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(() => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
         setIsLocked(true);
-      }, lockMinutes * 60 * 1000);
+      }, timeoutMs);
     };
 
     window.addEventListener('mousemove', resetTimer);
@@ -203,7 +187,7 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
     resetTimer();
 
     return () => {
-      clearTimeout(timeout);
+      clearTimeout(timer);
       window.removeEventListener('mousemove', resetTimer);
       window.removeEventListener('keydown', resetTimer);
       window.removeEventListener('click', resetTimer);
@@ -213,8 +197,8 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
   // PIN Unlock Handler
   const handleUnlockWithPin = async (e: React.FormEvent) => {
     e.preventDefault();
-    setIsUnlocking(true);
     setPinError(null);
+    setIsUnlocking(true);
 
     try {
       const res = await fetch('/api/auth/unlock-pin', {
@@ -222,15 +206,16 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pin: pinInput }),
       });
+
       const data = await res.json();
-      if (!res.ok) {
-        setPinError(data.error || 'Incorrect PIN');
-      } else {
+      if (res.ok) {
         setIsLocked(false);
         setPinInput('');
+      } else {
+        setPinError(data.error || 'Incorrect PIN');
       }
-    } catch (err: any) {
-      setPinError('Error unlocking session');
+    } catch {
+      setPinError('Connection error. Please try again.');
     } finally {
       setIsUnlocking(false);
     }
@@ -240,33 +225,119 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
   const handleLogout = async () => {
     try {
       await fetch('/api/auth/logout', { method: 'POST' });
-    } catch (e) {
-      // Ignored
+    } finally {
+      router.push('/admin/login');
     }
-    router.push('/admin/login');
   };
 
-  return (
-    <div className="min-h-screen bg-corporate-offwhite flex flex-col md:flex-row">
-      {/* PIN Quick-Unlock Overlay */}
-      {isLocked && (
-        <div className="fixed inset-0 z-50 bg-corporate-navy/95 backdrop-blur-md flex items-center justify-center p-4 animate-fade-in">
-          <div className="bg-white rounded-sm border border-corporate-hairline shadow-2xl p-8 max-w-sm w-full text-center">
-            <div className="w-12 h-12 bg-corporate-teal text-white rounded-sm flex items-center justify-center mx-auto mb-4">
-              <Lock className="w-6 h-6" />
-            </div>
-            <h2 className="text-xl font-black text-corporate-navy tracking-tight">Console Locked</h2>
-            <p className="text-xs text-slate-500 mt-1 mb-6">
-              Enter your 4-digit PIN to instantly resume your session.
-            </p>
+  // Schedule Date Navigation Helpers (Change 1)
+  const handlePrevDay = () => {
+    const [y, m, d] = scheduleDate.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d - 1, 12, 0, 0));
+    setScheduleDate(formatInDubai(dt, 'yyyy-MM-dd'));
+  };
 
-            <form onSubmit={handleUnlockWithPin} className="space-y-4">
-              {pinError && (
-                <div className="p-2.5 bg-rose-50 border border-rose-200 text-corporate-red text-xs rounded-sm font-semibold">
-                  {pinError}
-                </div>
-              )}
+  const handleNextDay = () => {
+    const [y, m, d] = scheduleDate.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d + 1, 12, 0, 0));
+    setScheduleDate(formatInDubai(dt, 'yyyy-MM-dd'));
+  };
 
+  const handleToday = () => {
+    setScheduleDate(formatInDubai(new Date(), 'yyyy-MM-dd'));
+  };
+
+  const formattedScheduleHeading = React.useMemo(() => {
+    const [y, m, d] = scheduleDate.split('-').map(Number);
+    const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+    return formatInDubai(dt, 'EEE, d MMM yyyy');
+  }, [scheduleDate]);
+
+  // Strict Dubai Day Filtering for Schedule View (Change 1)
+  const scheduleBookings = React.useMemo(() => {
+    return bookings.filter(
+      (b) => b.status === 'confirmed' && isOverlappingDubaiDay(b.start_time, b.end_time, scheduleDate)
+    );
+  }, [bookings, scheduleDate]);
+
+  const scheduleBlocks = React.useMemo(() => {
+    return blockedSlots.filter((block) => {
+      if (block.recurring_rule === 'FRIDAY_12_14') {
+        const [y, m, d] = scheduleDate.split('-').map(Number);
+        const dt = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+        return formatInDubai(dt, 'EEEE') === 'Friday';
+      }
+      return isOverlappingDubaiDay(block.start_time, block.end_time, scheduleDate);
+    });
+  }, [blockedSlots, scheduleDate]);
+
+  const nowLinePct = getDubaiNowLinePercentage(scheduleDate, settings);
+
+  // Filtered & Paginated Bookings (Change 4)
+  const filteredBookings = React.useMemo(() => {
+    return bookings
+      .filter((b) => bookingFilterRoom === 'ALL' || b.room_id === bookingFilterRoom)
+      .filter(
+        (b) =>
+          b.title.toLowerCase().includes(bookingSearch.toLowerCase()) ||
+          b.organizer_name.toLowerCase().includes(bookingSearch.toLowerCase()) ||
+          b.organizer_email.toLowerCase().includes(bookingSearch.toLowerCase())
+      );
+  }, [bookings, bookingFilterRoom, bookingSearch]);
+
+  const totalBookingPages = Math.max(1, Math.ceil(filteredBookings.length / BOOKINGS_PAGE_SIZE));
+  const paginatedBookings = filteredBookings.slice(
+    (bookingPage - 1) * BOOKINGS_PAGE_SIZE,
+    bookingPage * BOOKINGS_PAGE_SIZE
+  );
+
+  // Paginated Blocked Slots (Change 4)
+  const totalBlockPages = Math.max(1, Math.ceil(blockedSlots.length / BLOCKS_PAGE_SIZE));
+  const paginatedBlocks = blockedSlots.slice(
+    (blocksPage - 1) * BLOCKS_PAGE_SIZE,
+    blocksPage * BLOCKS_PAGE_SIZE
+  );
+
+  // Percentage position calculator for schedule timeline blocks
+  const computeSlotPercent = (startTimeIso: string, endTimeIso: string) => {
+    const sDate = typeof startTimeIso === 'string' ? parseISO(startTimeIso) : startTimeIso;
+    const eDate = typeof endTimeIso === 'string' ? parseISO(endTimeIso) : endTimeIso;
+
+    const sH = parseInt(formatInDubai(sDate, 'H'), 10);
+    const sM = parseInt(formatInDubai(sDate, 'm'), 10);
+    const eH = parseInt(formatInDubai(eDate, 'H'), 10);
+    const eM = parseInt(formatInDubai(eDate, 'm'), 10);
+
+    const startMinutes = (sH - 8) * 60 + sM;
+    const endMinutes = (eH - 8) * 60 + eM;
+
+    const clampedStart = Math.max(0, Math.min(720, startMinutes));
+    const clampedEnd = Math.max(0, Math.min(720, endMinutes));
+
+    const topPct = (clampedStart / 720) * 100;
+    const heightPct = Math.max(3.5, ((clampedEnd - clampedStart) / 720) * 100);
+
+    return { topPct, heightPct };
+  };
+
+  // -------------------------------------------------------------------------
+  // INACTIVITY PIN LOCK SCREEN
+  // -------------------------------------------------------------------------
+  if (isLocked) {
+    return (
+      <div className="fixed inset-0 z-50 bg-[#0B1F3A]/95 backdrop-blur-md flex items-center justify-center p-4">
+        <div className="bg-white rounded-sm border border-corporate-hairline shadow-2xl p-6 sm:p-8 max-w-sm w-full text-center">
+          <div className="w-12 h-12 rounded-full bg-teal-50 border border-teal-200 text-corporate-teal mx-auto flex items-center justify-center mb-4">
+            <Lock className="w-6 h-6" />
+          </div>
+
+          <h2 className="text-xl font-black text-corporate-navy tracking-tight">Console Locked</h2>
+          <p className="text-xs text-slate-500 mt-1">
+            Console locked due to inactivity. Enter your quick-unlock PIN to resume.
+          </p>
+
+          <form onSubmit={handleUnlockWithPin} className="space-y-4 mt-6">
+            <div>
               <input
                 id="pin-unlock-input"
                 type="password"
@@ -275,67 +346,68 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
                 placeholder="••••"
                 value={pinInput}
                 onChange={(e) => setPinInput(e.target.value.replace(/\D/g, ''))}
-                className="w-full text-center text-3xl tracking-[0.5em] font-mono h-14 border border-corporate-hairline rounded-sm focus:outline-none focus:ring-2 focus:ring-corporate-teal"
+                className="text-center font-mono text-3xl tracking-widest h-12 w-44 mx-auto border-2 border-corporate-hairline rounded-sm focus:border-corporate-teal outline-hidden bg-slate-50"
               />
+              {pinError && <p className="text-xs text-corporate-red font-semibold mt-2">{pinError}</p>}
+            </div>
 
-              <div className="grid grid-cols-3 gap-2 my-4">
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 'Clear', 0, 'Enter'].map((val, idx) => (
-                  <button
-                    key={idx}
-                    type="button"
-                    onClick={() => {
-                      if (val === 'Clear') setPinInput('');
-                      else if (val === 'Enter') handleUnlockWithPin({ preventDefault: () => {} } as any);
-                      else if (pinInput.length < 6) setPinInput((prev) => prev + String(val));
-                    }}
-                    className="h-10 text-sm font-bold bg-corporate-offwhite hover:bg-slate-200 text-corporate-charcoal rounded-sm border border-corporate-hairline transition-colors"
-                  >
-                    {val}
-                  </button>
-                ))}
-              </div>
-
-              <div className="flex items-center gap-2 pt-2">
-                <Button
+            <div className="grid grid-cols-3 gap-2 max-w-[200px] mx-auto pt-2">
+              {[1, 2, 3, 4, 5, 6, 7, 8, 9, 'C', 0, 'Enter'].map((val, idx) => (
+                <button
                   type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={handleLogout}
-                  className="w-1/2 text-xs"
+                  key={idx}
+                  onClick={() => {
+                    if (val === 'C') setPinInput('');
+                    else if (val === 'Enter') handleUnlockWithPin({ preventDefault: () => {} } as any);
+                    else if (pinInput.length < 6) setPinInput((p) => p + val);
+                  }}
+                  className="h-10 rounded-sm bg-slate-100 hover:bg-slate-200 text-corporate-charcoal font-bold text-sm transition-colors"
                 >
-                  Full Sign Out
-                </Button>
-                <Button
-                  type="submit"
-                  variant="primary"
-                  size="sm"
-                  isLoading={isUnlocking}
-                  className="w-1/2 bg-corporate-navy"
-                >
-                  Unlock
-                </Button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+                  {val}
+                </button>
+              ))}
+            </div>
 
-      {/* Deep Corporate Sidebar */}
-      <aside className="w-full md:w-64 bg-corporate-navy text-white flex-shrink-0 flex flex-col justify-between border-r border-corporate-hairline shadow-md">
+            <div className="pt-2 flex flex-col gap-2">
+              <Button
+                type="submit"
+                variant="primary"
+                className="w-full bg-corporate-teal"
+                disabled={isUnlocking || pinInput.length < 4}
+              >
+                {isUnlocking ? 'Unlocking...' : 'Unlock Console'}
+              </Button>
+              <Button type="button" variant="ghost" size="sm" onClick={handleLogout} className="text-xs text-slate-500">
+                Full Sign Out
+              </Button>
+            </div>
+          </form>
+        </div>
+      </div>
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // MAIN ADMIN CONSOLE APP SHELL (Change 4: 100vh, 0 scrollbars on desktop)
+  // -------------------------------------------------------------------------
+  return (
+    <div className="h-screen max-h-screen w-screen max-w-screen overflow-hidden flex bg-[#F7F5F0] text-corporate-charcoal font-sans select-none">
+      {/* FIXED SIDEBAR */}
+      <aside className="w-52 shrink-0 h-full flex flex-col justify-between border-r border-white/10 bg-[#0B1F3A] text-white p-2.5 select-none overflow-hidden">
         <div>
-          {/* App Title strictly 'Meeting Room Booking' */}
-          <div className="p-6 border-b border-white/10">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-teal-300">
-              Receptionist Console
+          {/* Header */}
+          <div className="px-2.5 py-3 border-b border-white/10">
+            <span className="text-[10px] font-bold tracking-[0.2em] text-teal-300 uppercase block">
+              Administration
             </span>
-            <h1 className="text-lg font-black tracking-tight text-white mt-0.5">
+            <h1 className="text-sm font-black tracking-tight text-white mt-0.5">
               Meeting Room Booking
             </h1>
-            <p className="text-[11px] text-slate-300 mt-1 font-mono">192.168.50.143 (Internal)</p>
+            <p className="text-[10px] text-slate-400 mt-0.5 font-mono">192.168.50.143:3005</p>
           </div>
 
-          {/* Navigation Items */}
-          <nav className="p-3 space-y-1">
+          {/* Nav Items (Audit Log and QR Signs removed) */}
+          <nav className="p-1.5 space-y-0.5 mt-2">
             {[
               { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
               { id: 'schedule', label: "Today's Schedule", icon: CalendarDays },
@@ -343,8 +415,6 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
               { id: 'rooms', label: 'Rooms & Capacity', icon: DoorClosed },
               { id: 'blocks', label: 'Blocked Slots', icon: ShieldBan },
               { id: 'screens', label: 'Display Screens', icon: Tv },
-              { id: 'qrcodes', label: 'QR Signs (Print A4)', icon: QrCode },
-              { id: 'audit', label: 'Audit Trail', icon: ScrollText },
               { id: 'settings', label: 'System Settings', icon: Settings },
             ].map((item) => {
               const Icon = item.icon;
@@ -353,17 +423,17 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
                 <button
                   key={item.id}
                   onClick={() => setActiveTab(item.id as TabKey)}
-                  className={`w-full flex items-center justify-between px-3 py-2.5 rounded-sm text-xs font-semibold transition-colors ${
+                  className={`w-full flex items-center justify-between px-2.5 py-2 rounded-sm text-xs font-semibold transition-colors ${
                     isActive
                       ? 'bg-corporate-teal text-white shadow-xs'
                       : 'text-slate-300 hover:text-white hover:bg-white/5'
                   }`}
                 >
-                  <div className="flex items-center gap-2.5">
-                    <Icon className="w-4 h-4 text-teal-300" />
+                  <div className="flex items-center gap-2">
+                    <Icon className="w-3.5 h-3.5 text-teal-300" />
                     <span>{item.label}</span>
                   </div>
-                  {isActive && <ChevronRight className="w-3.5 h-3.5" />}
+                  {isActive && <ChevronRight className="w-3 h-3 text-teal-200" />}
                 </button>
               );
             })}
@@ -371,17 +441,17 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         </div>
 
         {/* Footer actions */}
-        <div className="p-4 border-t border-white/10 space-y-2">
+        <div className="p-2 border-t border-white/10 space-y-1">
           <button
             onClick={() => setIsLocked(true)}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-sm text-xs font-medium text-slate-300 hover:text-white hover:bg-white/5 transition-colors"
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-sm text-xs font-medium text-slate-300 hover:text-white hover:bg-white/5 transition-colors"
           >
             <Lock className="w-3.5 h-3.5" />
-            <span>Lock Console (PIN)</span>
+            <span>Lock Console</span>
           </button>
           <button
             onClick={handleLogout}
-            className="w-full flex items-center gap-2 px-3 py-2 rounded-sm text-xs font-medium text-rose-300 hover:text-rose-100 hover:bg-rose-900/30 transition-colors"
+            className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-sm text-xs font-medium text-rose-300 hover:text-rose-100 hover:bg-rose-900/30 transition-colors"
           >
             <LogOut className="w-3.5 h-3.5" />
             <span>Sign Out</span>
@@ -389,146 +459,128 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         </div>
       </aside>
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex flex-col min-w-0 overflow-y-auto">
-        {/* Top bar with quick status */}
-        <header className="h-16 bg-white border-b border-corporate-hairline px-6 flex items-center justify-between">
+      {/* MAIN CONTENT AREA (Change 4: Fits 100vh exactly, no scrollbars) */}
+      <main className="flex-1 flex flex-col h-full min-w-0 overflow-hidden">
+        {/* Compact Header */}
+        <header className="h-11 shrink-0 bg-white border-b border-corporate-hairline px-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <h2 className="text-base font-bold text-corporate-navy uppercase tracking-wider">
+            <h2 className="text-xs font-bold text-corporate-navy uppercase tracking-wider">
               {activeTab === 'dashboard' && 'Operations Dashboard'}
               {activeTab === 'schedule' && "Today's Schedule Comparison"}
               {activeTab === 'bookings' && 'Reservations & Management'}
               {activeTab === 'rooms' && 'Meeting Rooms Configuration'}
               {activeTab === 'blocks' && 'Blocked & Maintenance Slots'}
               {activeTab === 'screens' && 'Wall-Mounted Display Screens'}
-              {activeTab === 'qrcodes' && 'Room QR Codes & Printable Signs'}
-              {activeTab === 'audit' && 'Security Audit Trail'}
               {activeTab === 'settings' && 'System Parameters & Security'}
             </h2>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2">
             {notification && (
-              <span className="text-xs bg-emerald-100 text-corporate-green px-3 py-1 rounded-sm border border-emerald-300 font-semibold animate-fade-in">
+              <span className="text-[11px] bg-emerald-50 text-corporate-green px-2.5 py-0.5 rounded-xs border border-emerald-300 font-semibold animate-fade-in">
                 {notification}
               </span>
             )}
 
-            <Button variant="outline" size="sm" onClick={fetchAllData} title="Refresh data">
-              <RefreshCw className="w-3.5 h-3.5 mr-1" />
+            <Button variant="outline" size="sm" onClick={fetchAllData} title="Refresh data" className="h-7 text-xs px-2.5">
+              <RefreshCw className="w-3 h-3 mr-1" />
               Refresh
             </Button>
 
             <Link href="/" target="_blank">
-              <Button variant="ghost" size="sm" className="text-xs text-slate-600">
-                <ExternalLink className="w-3.5 h-3.5 mr-1" />
+              <Button variant="ghost" size="sm" className="h-7 text-xs text-slate-600 px-2">
+                <ExternalLink className="w-3 h-3 mr-1" />
                 Public Directory
               </Button>
             </Link>
           </div>
         </header>
 
-        {/* Dynamic Tab Body */}
-        <div className="p-6">
+        {/* Content Body Container */}
+        <div className="flex-1 min-h-0 p-3 overflow-hidden flex flex-col">
           {/* TAB 1: DASHBOARD */}
           {activeTab === 'dashboard' && (
-            <div className="space-y-6">
-              {/* Stat KPIs */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                <div className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    Total Rooms
-                  </span>
-                  <div className="flex items-baseline justify-between mt-1">
-                    <span className="text-2xl font-black text-corporate-navy">{rooms.length}</span>
-                    <span className="text-xs text-corporate-green font-semibold">
-                      {rooms.filter((r) => r.is_active).length} Active
-                    </span>
+            <div className="h-full flex flex-col gap-3 overflow-hidden">
+              {/* Stat KPIs in 1 compact row */}
+              <div className="grid grid-cols-4 gap-3 shrink-0">
+                <div className="bg-white p-3 rounded-sm border border-corporate-hairline shadow-2xs">
+                  <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Total Rooms</span>
+                  <div className="flex items-baseline justify-between mt-0.5">
+                    <span className="text-xl font-black text-corporate-navy">{rooms.length}</span>
+                    <span className="text-[10px] text-slate-500">{rooms.filter((r) => r.is_active).length} Active</span>
                   </div>
                 </div>
 
-                <div className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    Bookings Today
-                  </span>
-                  <div className="flex items-baseline justify-between mt-1">
-                    <span className="text-2xl font-black text-corporate-navy">
-                      {stats?.bookingsToday ?? 0}
-                    </span>
-                    <span className="text-xs text-slate-500 font-medium">Confirmed</span>
+                <div className="bg-white p-3 rounded-sm border border-corporate-hairline shadow-2xs">
+                  <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Bookings Today</span>
+                  <div className="flex items-baseline justify-between mt-0.5">
+                    <span className="text-xl font-black text-corporate-navy">{stats?.bookingsToday ?? 0}</span>
+                    <span className="text-[10px] text-slate-500">Confirmed</span>
                   </div>
                 </div>
 
-                <div className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    Hours Reserved Today
-                  </span>
-                  <div className="flex items-baseline justify-between mt-1">
-                    <span className="text-2xl font-black text-corporate-teal">
-                      {stats?.hoursBookedToday ?? 0} hrs
-                    </span>
-                    <span className="text-xs text-slate-500">of 12h workday</span>
+                <div className="bg-white p-3 rounded-sm border border-corporate-hairline shadow-2xs">
+                  <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Hours Booked Today</span>
+                  <div className="flex items-baseline justify-between mt-0.5">
+                    <span className="text-xl font-black text-corporate-teal">{stats?.hoursBookedToday ?? 0} hrs</span>
+                    <span className="text-[10px] text-slate-500">of 12h workday</span>
                   </div>
                 </div>
 
-                <div className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                    Facility Utilization
-                  </span>
-                  <div className="flex items-baseline justify-between mt-1">
-                    <span className="text-2xl font-black text-corporate-navy">
-                      {stats?.utilizationPercentage ?? 0}%
-                    </span>
-                    <span className="text-xs text-corporate-teal font-semibold">Today</span>
+                <div className="bg-white p-3 rounded-sm border border-corporate-hairline shadow-2xs">
+                  <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Facility Utilization</span>
+                  <div className="flex items-baseline justify-between mt-0.5">
+                    <span className="text-xl font-black text-corporate-navy">{stats?.utilizationPercentage ?? 0}%</span>
+                    <span className="text-[10px] text-corporate-teal font-semibold">Today</span>
                   </div>
                 </div>
               </div>
 
-              {/* Live Room Cards */}
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
+              {/* Live Facilities Overview (5 Rooms side-by-side in 1 row) */}
+              <div className="flex-1 min-h-0 flex flex-col bg-white border border-corporate-hairline rounded-sm p-3 shadow-2xs">
+                <div className="flex items-center justify-between pb-2.5 border-b border-corporate-hairline shrink-0">
+                  <h3 className="text-xs font-bold text-corporate-navy uppercase tracking-wider">
                     Live Facilities Overview
                   </h3>
                   <Button
                     size="sm"
                     variant="primary"
                     onClick={() => setShowBookOnBehalfModal(true)}
-                    className="bg-corporate-teal"
+                    className="h-7 text-xs bg-corporate-teal"
                   >
-                    <Plus className="w-3.5 h-3.5 mr-1" />
+                    <Plus className="w-3 h-3 mr-1" />
                     Book on Behalf
                   </Button>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="grid grid-cols-5 gap-2.5 flex-1 min-h-0 pt-2.5 items-stretch">
                   {rooms.map((room) => {
                     const roomOverview = stats?.roomsOverview?.find((o: any) => o.room.id === room.id);
                     const status = roomOverview?.status;
                     const isFree = status?.state === 'available';
                     const isOccupied = status?.state === 'occupied';
-                    const isBlocked = status?.state === 'blocked';
 
                     return (
                       <div
                         key={room.id}
-                        className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs flex flex-col justify-between"
+                        className="bg-slate-50/70 p-3 rounded-xs border border-corporate-hairline flex flex-col justify-between overflow-hidden"
                       >
                         <div>
-                          <div className="flex items-start justify-between">
+                          <div className="flex items-start justify-between gap-1">
                             <div>
-                              <h4 className="text-base font-bold text-corporate-navy">{room.name}</h4>
-                              <p className="text-xs text-slate-500 mt-0.5">{room.location}</p>
+                              <h4 className="text-xs font-bold text-corporate-navy truncate">{room.name}</h4>
+                              <p className="text-[10px] text-slate-500 truncate">{room.location}</p>
                             </div>
                             <Badge
                               variant={isFree ? 'available' : isOccupied ? 'occupied' : 'unavailable'}
+                              className="text-[9px] px-1.5 py-0 shrink-0"
                             >
-                              {isFree ? 'Available' : isOccupied ? 'Occupied' : 'Unavailable'}
+                              {isFree ? 'Free' : isOccupied ? 'In Use' : 'Blocked'}
                             </Badge>
                           </div>
 
                           <div
-                            className={`p-3 rounded-xs text-xs mt-3 border ${
+                            className={`p-2 rounded-xs text-[11px] mt-2 border ${
                               isFree
                                 ? 'bg-emerald-50 border-emerald-200 text-corporate-green'
                                 : isOccupied
@@ -536,23 +588,23 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
                                 : 'bg-slate-100 border-slate-200 text-slate-600'
                             }`}
                           >
-                            <p className="font-semibold">{status?.bannerText || 'Checking status...'}</p>
+                            <p className="font-semibold line-clamp-2">{status?.bannerText || 'Checking status...'}</p>
                             {status?.nextMeetingSummary && (
-                              <p className="text-[11px] text-slate-600 mt-0.5">
+                              <p className="text-[10px] text-slate-500 mt-1 line-clamp-2">
                                 {status.nextMeetingSummary}
                               </p>
                             )}
                           </div>
                         </div>
 
-                        <div className="mt-4 pt-3 border-t border-corporate-hairline flex items-center justify-between text-xs text-slate-600">
-                          <span>Capacity: {room.capacity}</span>
+                        <div className="mt-2 pt-2 border-t border-slate-200 flex items-center justify-between text-[10px] text-slate-500">
+                          <span>Cap: {room.capacity}</span>
                           <Link
                             href={`/room/${room.id}`}
                             target="_blank"
-                            className="text-corporate-teal font-semibold hover:underline flex items-center gap-1"
+                            className="text-corporate-teal font-semibold hover:underline flex items-center gap-0.5"
                           >
-                            Open Room <ArrowRight className="w-3 h-3" />
+                            Open <ArrowRight className="w-2.5 h-2.5" />
                           </Link>
                         </div>
                       </div>
@@ -563,84 +615,192 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             </div>
           )}
 
-          {/* TAB 2: TODAY'S SCHEDULE (SIDE-BY-SIDE) */}
+          {/* TAB 2: TODAY'S SCHEDULE (Multi-room Timeline, Scales to height, zero scrollbar) */}
           {activeTab === 'schedule' && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between bg-white p-4 rounded-sm border border-corporate-hairline">
-                <div>
-                  <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
-                    Multi-Room Daily Timeline
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Comparing all {rooms.length} rooms simultaneously for today (Dubai Time UTC+4)
-                  </p>
+            <div className="h-full flex flex-col gap-2 overflow-hidden">
+              {/* Date Navigation & Controls Bar (Change 1) */}
+              <div className="h-9 shrink-0 bg-white px-3 rounded-sm border border-corporate-hairline flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <div className="flex items-center rounded-xs border border-corporate-hairline overflow-hidden bg-slate-50">
+                    <button
+                      onClick={handlePrevDay}
+                      className="h-6 px-2 hover:bg-slate-200 text-xs font-bold text-corporate-charcoal"
+                      title="Previous Day"
+                    >
+                      <ChevronLeft className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={handleToday}
+                      className="h-6 px-2.5 hover:bg-slate-200 text-xs font-semibold border-x border-corporate-hairline text-corporate-navy"
+                    >
+                      Today
+                    </button>
+                    <button
+                      onClick={handleNextDay}
+                      className="h-6 px-2 hover:bg-slate-200 text-xs font-bold text-corporate-charcoal"
+                      title="Next Day"
+                    >
+                      <ChevronRight className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <input
+                    type="date"
+                    value={scheduleDate}
+                    onChange={(e) => e.target.value && setScheduleDate(e.target.value)}
+                    className="h-6 px-2 text-xs border border-corporate-hairline rounded-xs bg-white text-corporate-charcoal"
+                  />
+
+                  <h3 className="text-xs font-black text-corporate-navy ml-1">{formattedScheduleHeading}</h3>
                 </div>
-                <div className="flex items-center gap-3 text-xs">
+
+                <div className="flex items-center gap-3 text-[10px]">
                   <span className="flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-emerald-500" /> Free
+                    <span className="w-2 h-2 rounded-xs bg-emerald-500" /> Free
                   </span>
                   <span className="flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-corporate-red" /> Occupied
+                    <span className="w-2 h-2 rounded-xs bg-corporate-red" /> Occupied
                   </span>
                   <span className="flex items-center gap-1.5">
-                    <span className="w-2.5 h-2.5 rounded-xs bg-slate-400" /> Blocked
+                    <span className="w-2 h-2 rounded-xs bg-slate-400" /> Blocked
                   </span>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={() => setShowBookOnBehalfModal(true)}
+                    className="h-6 text-xs bg-corporate-navy ml-2 px-2"
+                  >
+                    <Plus className="w-3 h-3 mr-1" /> Book
+                  </Button>
                 </div>
               </div>
 
-              {/* Side by side columns */}
-              <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
-                {rooms.map((room) => {
-                  const roomBookings = bookings.filter((b) => b.room_id === room.id && b.status === 'confirmed');
-                  return (
+              {/* Scaled Multi-Room Timeline (Fits 08:00 - 20:00 on screen without scrolling) */}
+              <div className="flex-1 min-h-0 bg-white border border-corporate-hairline rounded-sm flex flex-col overflow-hidden shadow-2xs">
+                {/* Room Headers Row */}
+                <div className="h-7 shrink-0 grid grid-cols-[48px_repeat(5,1fr)] bg-corporate-navy text-white text-center border-b border-corporate-navy items-center text-xs font-bold">
+                  <div className="text-[10px] text-teal-300 font-mono">GST</div>
+                  {rooms.map((room) => (
                     <div
                       key={room.id}
-                      className="bg-white border border-corporate-hairline rounded-sm shadow-xs overflow-hidden"
+                      className="truncate px-1 border-l border-white/10 flex items-center justify-center gap-1"
                     >
-                      <div className="p-3 bg-corporate-navy text-white text-center border-b border-corporate-navy">
-                        <h4 className="text-xs font-bold uppercase tracking-wider">{room.name}</h4>
-                        <span className="text-[10px] text-teal-300">Cap: {room.capacity}</span>
+                      <span className="truncate">{room.name}</span>
+                      <span className="text-[10px] text-teal-300 font-normal">({room.capacity})</span>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Timeline Grid: 12 Hours (08:00 to 20:00) */}
+                <div className="flex-1 min-h-0 relative grid grid-cols-[48px_repeat(5,1fr)]">
+                  {/* Left Time Axis */}
+                  <div className="h-full flex flex-col justify-between border-r border-corporate-hairline text-[9px] text-slate-400 font-mono select-none text-center bg-slate-50/70">
+                    {HOURS_LIST.map((h) => (
+                      <div key={h} className="flex-1 flex items-start justify-center border-b border-dashed border-slate-200 last:border-b-0">
+                        <span>{String(h).padStart(2, '0')}:00</span>
                       </div>
-                      <div className="p-3 space-y-2 min-h-[360px] max-h-[600px] overflow-y-auto">
-                        {roomBookings.length === 0 ? (
-                          <div className="h-48 flex items-center justify-center text-center text-xs text-slate-400">
-                            No meetings today. Entirely available.
-                          </div>
-                        ) : (
-                          roomBookings.map((b) => (
+                    ))}
+                  </div>
+
+                  {/* 5 Room Columns */}
+                  {rooms.map((room) => {
+                    const roomBookings = scheduleBookings.filter((b) => b.room_id === room.id);
+                    const roomBlocks = scheduleBlocks.filter(
+                      (b) => b.room_id === null || b.room_id === room.id
+                    );
+
+                    return (
+                      <div
+                        key={room.id}
+                        className="h-full relative border-r border-corporate-hairline last:border-r-0 overflow-hidden"
+                      >
+                        {/* Background Hour Lines */}
+                        <div className="absolute inset-0 flex flex-col justify-between pointer-events-none">
+                          {HOURS_LIST.map((h) => (
+                            <div key={h} className="flex-1 border-b border-slate-100 last:border-b-0" />
+                          ))}
+                        </div>
+
+                        {/* Confirmed Bookings for selected day */}
+                        {roomBookings.map((b) => {
+                          const { topPct, heightPct } = computeSlotPercent(b.start_time, b.end_time);
+                          return (
                             <div
                               key={b.id}
-                              className="p-2.5 rounded-xs bg-rose-50 border border-rose-200 text-corporate-charcoal text-xs shadow-2xs"
+                              style={{ top: `${topPct}%`, height: `${heightPct}%` }}
+                              className="absolute left-1 right-1 rounded-xs bg-rose-100/90 border border-rose-300 text-corporate-charcoal p-1 overflow-hidden shadow-2xs z-10 flex flex-col justify-center cursor-pointer hover:border-corporate-red"
+                              title={`${b.title} (${formatInDubai(b.start_time, 'HH:mm')} – ${formatInDubai(
+                                b.end_time,
+                                'HH:mm'
+                              )}) by ${b.organizer_name}`}
+                              onClick={() => {
+                                setEditingBooking(b);
+                                setShowEditBookingModal(true);
+                              }}
                             >
-                              <span className="font-mono font-bold text-corporate-red block text-[11px]">
+                              <div className="text-[9px] font-mono font-bold text-corporate-red truncate leading-tight">
                                 {formatInDubai(b.start_time, 'HH:mm')} – {formatInDubai(b.end_time, 'HH:mm')}
-                              </span>
-                              <span className="font-bold text-corporate-navy block line-clamp-1 mt-0.5">
+                              </div>
+                              <div className="text-[10px] font-bold text-corporate-navy truncate leading-tight">
                                 {b.title}
-                              </span>
-                              <span className="text-[11px] text-slate-500 block truncate">
+                              </div>
+                              <div className="text-[9px] text-slate-500 truncate leading-tight">
                                 {b.organizer_name}
-                              </span>
+                              </div>
                             </div>
-                          ))
+                          );
+                        })}
+
+                        {/* Blocked Slots for selected day */}
+                        {roomBlocks.map((block) => {
+                          const { topPct, heightPct } = computeSlotPercent(block.start_time, block.end_time);
+                          return (
+                            <div
+                              key={block.id}
+                              style={{ top: `${topPct}%`, height: `${heightPct}%` }}
+                              className="absolute left-1 right-1 rounded-xs bg-slate-200/90 border border-slate-300 text-slate-700 p-1 overflow-hidden shadow-2xs z-10 flex flex-col justify-center"
+                              title={`Unavailable: ${block.title}`}
+                            >
+                              <div className="text-[9px] font-mono font-bold text-slate-600 truncate">
+                                Unavailable
+                              </div>
+                              <div className="text-[10px] font-semibold text-slate-800 truncate">
+                                {block.title}
+                              </div>
+                            </div>
+                          );
+                        })}
+
+                        {/* Live Now Line */}
+                        {nowLinePct !== null && (
+                          <div
+                            style={{ top: `${nowLinePct}%` }}
+                            className="absolute left-0 right-0 border-t-2 border-red-500 z-20 pointer-events-none"
+                          >
+                            <span className="absolute -top-1 -left-0.5 w-2 h-2 rounded-full bg-red-500" />
+                          </div>
                         )}
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
+                </div>
               </div>
             </div>
           )}
 
-          {/* TAB 3: BOOKINGS MANAGER */}
+          {/* TAB 3: ALL BOOKINGS (Paginated, zero scrollbar) */}
           {activeTab === 'bookings' && (
-            <div className="space-y-4">
-              <div className="bg-white p-4 rounded-sm border border-corporate-hairline flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                <div className="flex flex-wrap items-center gap-3">
+            <div className="h-full flex flex-col gap-2.5 overflow-hidden">
+              {/* Filter Bar */}
+              <div className="bg-white p-2.5 rounded-sm border border-corporate-hairline flex items-center justify-between shrink-0 shadow-2xs">
+                <div className="flex items-center gap-2">
                   <select
                     value={bookingFilterRoom}
-                    onChange={(e) => setBookingFilterRoom(e.target.value)}
-                    className="h-9 px-3 text-xs border border-corporate-hairline rounded-sm bg-white text-corporate-charcoal"
+                    onChange={(e) => {
+                      setBookingFilterRoom(e.target.value);
+                      setBookingPage(1);
+                    }}
+                    className="h-7 px-2.5 text-xs border border-corporate-hairline rounded-sm bg-white text-corporate-charcoal"
                   >
                     <option value="ALL">All Meeting Rooms</option>
                     {rooms.map((r) => (
@@ -650,14 +810,17 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
                     ))}
                   </select>
 
-                  <div className="relative w-64">
-                    <Search className="w-3.5 h-3.5 absolute left-3 top-3 text-slate-400" />
+                  <div className="relative w-56">
+                    <Search className="w-3 h-3 absolute left-2.5 top-2 text-slate-400" />
                     <input
                       type="text"
                       placeholder="Search title, organizer..."
                       value={bookingSearch}
-                      onChange={(e) => setBookingSearch(e.target.value)}
-                      className="h-9 w-full pl-9 pr-3 text-xs border border-corporate-hairline rounded-sm"
+                      onChange={(e) => {
+                        setBookingSearch(e.target.value);
+                        setBookingPage(1);
+                      }}
+                      className="h-7 w-full pl-7 pr-2.5 text-xs border border-corporate-hairline rounded-sm"
                     />
                   </div>
                 </div>
@@ -666,276 +829,418 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
                   size="sm"
                   variant="primary"
                   onClick={() => setShowBookOnBehalfModal(true)}
-                  className="bg-corporate-navy"
+                  className="h-7 text-xs bg-corporate-navy"
                 >
-                  <Plus className="w-3.5 h-3.5 mr-1" />
+                  <Plus className="w-3 h-3 mr-1" />
                   + Book on Behalf
                 </Button>
               </div>
 
               {/* Bookings Table */}
-              <div className="bg-white border border-corporate-hairline rounded-sm shadow-xs overflow-x-auto">
+              <div className="flex-1 min-h-0 bg-white border border-corporate-hairline rounded-sm shadow-2xs flex flex-col justify-between overflow-hidden">
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-corporate-offwhite border-b border-corporate-hairline text-corporate-charcoal font-semibold uppercase tracking-wider text-[10px]">
+                        <th className="p-2.5">Room</th>
+                        <th className="p-2.5">Date & Time (Dubai)</th>
+                        <th className="p-2.5">Meeting Title</th>
+                        <th className="p-2.5">Organizer</th>
+                        <th className="p-2.5">Status</th>
+                        <th className="p-2.5 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-corporate-hairline">
+                      {paginatedBookings.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="p-8 text-center text-slate-400">
+                            No reservations found matching the filters.
+                          </td>
+                        </tr>
+                      ) : (
+                        paginatedBookings.map((b) => {
+                          const roomObj = rooms.find((r) => r.id === b.room_id);
+                          return (
+                            <tr key={b.id} className="hover:bg-slate-50 transition-colors">
+                              <td className="p-2.5 font-semibold text-corporate-navy">
+                                {roomObj?.name || 'Unknown Room'}
+                              </td>
+                              <td className="p-2.5 font-mono text-corporate-charcoal">
+                                <div>{formatInDubai(b.start_time, 'EEE, d MMM yyyy')}</div>
+                                <div className="text-slate-500 text-[10px]">
+                                  {formatInDubai(b.start_time, 'HH:mm')} – {formatInDubai(b.end_time, 'HH:mm')}
+                                </div>
+                              </td>
+                              <td className="p-2.5 font-medium text-corporate-charcoal truncate max-w-xs">{b.title}</td>
+                              <td className="p-2.5">
+                                <div className="font-semibold truncate max-w-[150px]">{b.organizer_name}</div>
+                                <div className="text-slate-400 text-[10px] truncate max-w-[150px]">{b.organizer_email}</div>
+                              </td>
+                              <td className="p-2.5">
+                                <Badge variant={b.status === 'confirmed' ? 'available' : 'unavailable'} className="text-[10px]">
+                                  {b.status}
+                                </Badge>
+                              </td>
+                              <td className="p-2.5 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  {b.status === 'confirmed' && (
+                                    <>
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        className="h-6 text-[10px] px-2"
+                                        onClick={() => {
+                                          setEditingBooking(b);
+                                          setShowEditBookingModal(true);
+                                        }}
+                                      >
+                                        Edit
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="danger"
+                                        className="h-6 text-[10px] px-2"
+                                        onClick={async () => {
+                                          if (confirm(`Cancel reservation "${b.title}"?`)) {
+                                            const res = await fetch(`/api/bookings/${b.id}`, { method: 'DELETE' });
+                                            if (res.ok) {
+                                              showNotify('Booking cancelled successfully');
+                                              fetchAllData();
+                                            }
+                                          }
+                                        }}
+                                      >
+                                        Cancel
+                                      </Button>
+                                    </>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                {/* Pagination Controls */}
+                <div className="h-9 shrink-0 px-3 border-t border-corporate-hairline bg-slate-50 flex items-center justify-between text-xs text-slate-500">
+                  <span>
+                    Showing {filteredBookings.length > 0 ? (bookingPage - 1) * BOOKINGS_PAGE_SIZE + 1 : 0} to{' '}
+                    {Math.min(bookingPage * BOOKINGS_PAGE_SIZE, filteredBookings.length)} of {filteredBookings.length}
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 text-xs px-2"
+                      disabled={bookingPage <= 1}
+                      onClick={() => setBookingPage((p) => Math.max(1, p - 1))}
+                    >
+                      Previous
+                    </Button>
+                    <span className="text-xs font-semibold px-1">
+                      {bookingPage} / {totalBookingPages}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 text-xs px-2"
+                      disabled={bookingPage >= totalBookingPages}
+                      onClick={() => setBookingPage((p) => Math.min(totalBookingPages, p + 1))}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* TAB 4: ROOMS & CAPACITY */}
+          {activeTab === 'rooms' && (
+            <div className="h-full flex flex-col gap-2.5 overflow-hidden">
+              <div className="bg-white p-2.5 rounded-sm border border-corporate-hairline flex items-center justify-between shrink-0 shadow-2xs">
+                <div>
+                  <h3 className="text-xs font-bold text-corporate-navy uppercase tracking-wider">
+                    Meeting Rooms Directory ({rooms.length} Total)
+                  </h3>
+                  <p className="text-[11px] text-slate-500">Each room has its unique QR and permanent booking URL.</p>
+                </div>
+                <Button size="sm" variant="primary" onClick={() => setShowAddRoomModal(true)} className="h-7 text-xs bg-corporate-navy">
+                  <Plus className="w-3 h-3 mr-1" /> Add Room
+                </Button>
+              </div>
+
+              <div className="flex-1 min-h-0 bg-white border border-corporate-hairline rounded-sm shadow-2xs overflow-hidden">
                 <table className="w-full text-left border-collapse text-xs">
                   <thead>
                     <tr className="bg-corporate-offwhite border-b border-corporate-hairline text-corporate-charcoal font-semibold uppercase tracking-wider text-[10px]">
-                      <th className="p-3">Room</th>
-                      <th className="p-3">Date & Time (Dubai)</th>
-                      <th className="p-3">Meeting Title</th>
-                      <th className="p-3">Organizer</th>
-                      <th className="p-3">Status</th>
-                      <th className="p-3 text-right">Actions</th>
+                      <th className="p-2.5">Room</th>
+                      <th className="p-2.5">Location</th>
+                      <th className="p-2.5">Capacity</th>
+                      <th className="p-2.5">Amenities</th>
+                      <th className="p-2.5">Status</th>
+                      <th className="p-2.5 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-corporate-hairline">
-                    {bookings
-                      .filter((b) => bookingFilterRoom === 'ALL' || b.room_id === bookingFilterRoom)
-                      .filter(
-                        (b) =>
-                          b.title.toLowerCase().includes(bookingSearch.toLowerCase()) ||
-                          b.organizer_name.toLowerCase().includes(bookingSearch.toLowerCase())
-                      )
-                      .map((b) => {
-                        const roomObj = rooms.find((r) => r.id === b.room_id);
-                        return (
-                          <tr key={b.id} className="hover:bg-slate-50 transition-colors">
-                            <td className="p-3 font-semibold text-corporate-navy">
-                              {roomObj?.name || 'Unknown Room'}
-                            </td>
-                            <td className="p-3 font-mono text-corporate-charcoal">
-                              <div>{formatInDubai(b.start_time, 'EEE, d MMM yyyy')}</div>
-                              <div className="text-slate-500 text-[11px]">
-                                {formatInDubai(b.start_time, 'HH:mm')} – {formatInDubai(b.end_time, 'HH:mm')}
-                              </div>
-                            </td>
-                            <td className="p-3 font-medium text-corporate-charcoal">{b.title}</td>
-                            <td className="p-3">
-                              <div className="font-semibold">{b.organizer_name}</div>
-                              <div className="text-slate-400 text-[10px]">{b.organizer_email}</div>
-                            </td>
-                            <td className="p-3">
-                              <Badge variant={b.status === 'confirmed' ? 'available' : 'unavailable'}>
-                                {b.status}
-                              </Badge>
-                            </td>
-                            <td className="p-3 text-right">
-                              <div className="flex items-center justify-end gap-1.5">
-                                {b.status === 'confirmed' && (
-                                  <>
-                                    <Button
-                                      size="sm"
-                                      variant="outline"
-                                      onClick={() => {
-                                        setEditingBooking(b);
-                                        setShowEditBookingModal(true);
-                                      }}
-                                    >
-                                      Edit / Move
-                                    </Button>
-                                    <Button
-                                      size="sm"
-                                      variant="danger"
-                                      onClick={async () => {
-                                        if (confirm(`Cancel reservation "${b.title}"?`)) {
-                                          const res = await fetch(`/api/bookings/${b.id}`, {
-                                            method: 'DELETE',
-                                          });
-                                          if (res.ok) {
-                                            showNotify('Booking cancelled successfully');
-                                            fetchAllData();
-                                          }
-                                        }
-                                      }}
-                                    >
-                                      Cancel
-                                    </Button>
-                                  </>
-                                )}
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      })}
+                    {rooms.map((room) => (
+                      <tr key={room.id} className="hover:bg-slate-50 transition-colors">
+                        <td className="p-2.5 font-bold text-corporate-navy">{room.name}</td>
+                        <td className="p-2.5 text-slate-600">{room.location}</td>
+                        <td className="p-2.5 font-semibold">{room.capacity} Persons</td>
+                        <td className="p-2.5 text-slate-500 truncate max-w-xs">{room.amenities?.join(', ') || 'Standard setup'}</td>
+                        <td className="p-2.5">
+                          <Badge variant={room.is_active ? 'available' : 'unavailable'} className="text-[10px]">
+                            {room.is_active ? 'Active' : 'Inactive'}
+                          </Badge>
+                        </td>
+                        <td className="p-2.5 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 text-[10px] px-2"
+                              onClick={() => {
+                                setEditingRoom(room);
+                                setShowEditRoomModal(true);
+                              }}
+                            >
+                              Edit
+                            </Button>
+                            <Link href={`/room/${room.id}`} target="_blank">
+                              <Button size="sm" variant="ghost" className="h-6 text-[10px] px-2 text-corporate-teal">
+                                Open
+                              </Button>
+                            </Link>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
             </div>
           )}
 
-          {/* TAB 4: ROOMS MANAGER */}
-          {activeTab === 'rooms' && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between bg-white p-4 rounded-sm border border-corporate-hairline">
+          {/* TAB 5: BLOCKED SLOTS (Paginated, zero scrollbar) */}
+          {activeTab === 'blocks' && (
+            <div className="h-full flex flex-col gap-2.5 overflow-hidden">
+              <div className="bg-white p-2.5 rounded-sm border border-corporate-hairline flex items-center justify-between shrink-0 shadow-2xs">
                 <div>
-                  <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
-                    Room Facilities Directory
+                  <h3 className="text-xs font-bold text-corporate-navy uppercase tracking-wider">
+                    Maintenance & Reserved Blocks
                   </h3>
-                  <p className="text-xs text-slate-500">
-                    Add, edit capacity, or deactivate meeting spaces
+                  <p className="text-[11px] text-slate-500">
+                    Blocks prevent employees from booking rooms during prayer breaks or events.
                   </p>
                 </div>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  onClick={() => setShowAddRoomModal(true)}
-                  className="bg-corporate-navy"
-                >
-                  <Plus className="w-3.5 h-3.5 mr-1" />
-                  + Add Room
+                <Button size="sm" variant="primary" onClick={() => setShowAddBlockModal(true)} className="h-7 text-xs bg-corporate-red">
+                  <ShieldBan className="w-3 h-3 mr-1" /> + Block Time Slot
                 </Button>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {rooms.map((room) => (
-                  <div
-                    key={room.id}
-                    className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs flex flex-col justify-between"
-                  >
-                    <div>
-                      <div className="flex items-start justify-between">
-                        <div>
-                          <h4 className="text-base font-bold text-corporate-navy">{room.name}</h4>
-                          <p className="text-xs text-slate-500">{room.location}</p>
-                        </div>
-                        <Badge variant={room.is_active ? 'available' : 'unavailable'}>
-                          {room.is_active ? 'Active' : 'Inactive'}
-                        </Badge>
-                      </div>
+              <div className="flex-1 min-h-0 bg-white border border-corporate-hairline rounded-sm shadow-2xs flex flex-col justify-between overflow-hidden">
+                <div className="flex-1 min-h-0 overflow-hidden">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-corporate-offwhite border-b border-corporate-hairline text-corporate-charcoal font-semibold uppercase tracking-wider text-[10px]">
+                        <th className="p-2.5">Scope</th>
+                        <th className="p-2.5">Block Title / Reason</th>
+                        <th className="p-2.5">Start Time (Dubai)</th>
+                        <th className="p-2.5">End Time (Dubai)</th>
+                        <th className="p-2.5">Recurrence</th>
+                        <th className="p-2.5 text-right">Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-corporate-hairline">
+                      {paginatedBlocks.length === 0 ? (
+                        <tr>
+                          <td colSpan={6} className="p-8 text-center text-slate-400">
+                            No blocked time slots found.
+                          </td>
+                        </tr>
+                      ) : (
+                        paginatedBlocks.map((block) => {
+                          const roomObj = rooms.find((r) => r.id === block.room_id);
+                          return (
+                            <tr key={block.id} className="hover:bg-slate-50 transition-colors">
+                              <td className="p-2.5 font-bold text-corporate-navy">
+                                {block.room_id ? roomObj?.name || 'Specific Room' : 'ALL ROOMS'}
+                              </td>
+                              <td className="p-2.5">
+                                <div className="font-semibold text-corporate-charcoal">{block.title}</div>
+                                {block.reason && <div className="text-[10px] text-slate-400 truncate max-w-xs">{block.reason}</div>}
+                              </td>
+                              <td className="p-2.5 font-mono text-slate-600">
+                                {formatInDubai(block.start_time, 'd MMM yyyy, HH:mm')}
+                              </td>
+                              <td className="p-2.5 font-mono text-slate-600">
+                                {formatInDubai(block.end_time, 'd MMM yyyy, HH:mm')}
+                              </td>
+                              <td className="p-2.5">
+                                {block.recurring_rule ? (
+                                  <Badge variant="unavailable" className="text-[10px]">
+                                    Weekly Friday
+                                  </Badge>
+                                ) : (
+                                  <span className="text-slate-400">One-time</span>
+                                )}
+                              </td>
+                              <td className="p-2.5 text-right">
+                                <Button
+                                  size="sm"
+                                  variant="danger"
+                                  className="h-6 text-[10px] px-2"
+                                  onClick={async () => {
+                                    if (confirm(`Remove block "${block.title}"?`)) {
+                                      const res = await fetch(`/api/blocks/${block.id}`, { method: 'DELETE' });
+                                      if (res.ok) {
+                                        showNotify('Block deleted');
+                                        fetchAllData();
+                                      }
+                                    }
+                                  }}
+                                >
+                                  Delete
+                                </Button>
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
 
-                      <div className="my-3 space-y-1.5 text-xs text-slate-600">
-                        <div className="flex items-center gap-1.5 font-medium">
-                          <Users className="w-3.5 h-3.5 text-corporate-teal" />
-                          <span>Capacity: {room.capacity} Persons</span>
-                        </div>
-                        {room.amenities && (
-                          <div className="flex flex-wrap gap-1 pt-1">
-                            {room.amenities.map((a, i) => (
-                              <span
-                                key={i}
-                                className="px-1.5 py-0.5 rounded-xs text-[10px] bg-slate-100 border border-slate-200"
-                              >
-                                {a}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="pt-3 border-t border-corporate-hairline flex items-center justify-between gap-2">
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        onClick={() => {
-                          setEditingRoom(room);
-                          setShowEditRoomModal(true);
-                        }}
-                      >
-                        <Edit2 className="w-3 h-3 mr-1" />
-                        Edit
-                      </Button>
-
-                      <Button
-                        size="sm"
-                        variant={room.is_active ? 'danger' : 'secondary'}
-                        onClick={async () => {
-                          const res = await fetch(`/api/rooms/${room.id}`, {
-                            method: 'PATCH',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ is_active: !room.is_active }),
-                          });
-                          if (res.ok) {
-                            showNotify(`Room ${room.is_active ? 'deactivated' : 'activated'}`);
-                            fetchAllData();
-                          }
-                        }}
-                      >
-                        {room.is_active ? 'Deactivate' : 'Activate'}
-                      </Button>
-                    </div>
+                <div className="h-9 shrink-0 px-3 border-t border-corporate-hairline bg-slate-50 flex items-center justify-between text-xs text-slate-500">
+                  <span>
+                    Showing {blockedSlots.length > 0 ? (blocksPage - 1) * BLOCKS_PAGE_SIZE + 1 : 0} to{' '}
+                    {Math.min(blocksPage * BLOCKS_PAGE_SIZE, blockedSlots.length)} of {blockedSlots.length}
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 text-xs px-2"
+                      disabled={blocksPage <= 1}
+                      onClick={() => setBlocksPage((p) => Math.max(1, p - 1))}
+                    >
+                      Previous
+                    </Button>
+                    <span className="text-xs font-semibold px-1">
+                      {blocksPage} / {totalBlockPages}
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-6 text-xs px-2"
+                      disabled={blocksPage >= totalBlockPages}
+                      onClick={() => setBlocksPage((p) => Math.min(totalBlockPages, p + 1))}
+                    >
+                      Next
+                    </Button>
                   </div>
-                ))}
+                </div>
               </div>
             </div>
           )}
 
-          {/* TAB 5: BLOCKED SLOTS */}
-          {activeTab === 'blocks' && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between bg-white p-4 rounded-sm border border-corporate-hairline">
+          {/* TAB 6: DISPLAY SCREENS */}
+          {activeTab === 'screens' && (
+            <div className="h-full flex flex-col gap-2.5 overflow-hidden">
+              <div className="bg-white p-2.5 rounded-sm border border-corporate-hairline flex items-center justify-between shrink-0 shadow-2xs">
                 <div>
-                  <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
-                    Blocked Slots &amp; Maintenance
+                  <h3 className="text-xs font-bold text-corporate-navy uppercase tracking-wider">
+                    Wall-Mounted Display Screens
                   </h3>
-                  <p className="text-xs text-slate-500">
-                    Schedule recurring or one-off unavailability across facilities
+                  <p className="text-[11px] text-slate-500">
+                    Dedicated tablet screens mounted outside each room running silent background heartbeats.
                   </p>
                 </div>
-                <Button
-                  size="sm"
-                  variant="primary"
-                  onClick={() => setShowAddBlockModal(true)}
-                  className="bg-corporate-navy"
-                >
-                  <Plus className="w-3.5 h-3.5 mr-1" />
-                  + Block Time Slot
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Link href="/display/lobby" target="_blank">
+                    <Button size="sm" variant="outline" className="h-7 text-xs">
+                      Open Lobby Board
+                    </Button>
+                  </Link>
+                  <Button
+                    size="sm"
+                    variant="primary"
+                    onClick={() => setShowRegisterScreenModal(true)}
+                    className="h-7 text-xs bg-corporate-navy"
+                  >
+                    <Plus className="w-3 h-3 mr-1" /> Add Display
+                  </Button>
+                </div>
               </div>
 
-              <div className="bg-white border border-corporate-hairline rounded-sm overflow-x-auto shadow-xs">
+              <div className="flex-1 min-h-0 bg-white border border-corporate-hairline rounded-sm shadow-2xs overflow-hidden">
                 <table className="w-full text-left border-collapse text-xs">
                   <thead>
-                    <tr className="bg-corporate-offwhite border-b border-corporate-hairline text-corporate-charcoal uppercase tracking-wider text-[10px]">
-                      <th className="p-3">Title / Reason</th>
-                      <th className="p-3">Scope</th>
-                      <th className="p-3">Rule / Period</th>
-                      <th className="p-3">Created By</th>
-                      <th className="p-3 text-right">Action</th>
+                    <tr className="bg-corporate-offwhite border-b border-corporate-hairline text-corporate-charcoal font-semibold uppercase tracking-wider text-[10px]">
+                      <th className="p-2.5">Screen Name</th>
+                      <th className="p-2.5">Room</th>
+                      <th className="p-2.5">Orientation</th>
+                      <th className="p-2.5">Status</th>
+                      <th className="p-2.5">Last Seen</th>
+                      <th className="p-2.5 text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-corporate-hairline">
-                    {blockedSlots.map((b) => {
-                      const targetRoom = b.room_id ? rooms.find((r) => r.id === b.room_id) : null;
+                    {screens.map((screen) => {
+                      const roomObj = rooms.find((r) => r.id === screen.room_id);
                       return (
-                        <tr key={b.id} className="hover:bg-slate-50 transition-colors">
-                          <td className="p-3 font-bold text-corporate-navy">
-                            {b.title}
-                            {b.reason && <p className="text-slate-500 font-normal">{b.reason}</p>}
-                          </td>
-                          <td className="p-3">
-                            <span className="font-semibold text-corporate-teal">
-                              {targetRoom ? targetRoom.name : 'ALL 5 ROOMS'}
+                        <tr key={screen.id} className="hover:bg-slate-50 transition-colors">
+                          <td className="p-2.5 font-bold text-corporate-navy">{screen.name}</td>
+                          <td className="p-2.5 text-slate-700">{roomObj?.name || 'Lobby'}</td>
+                          <td className="p-2.5 capitalize">{screen.orientation}</td>
+                          <td className="p-2.5">
+                            <span
+                              className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                                screen.is_online
+                                  ? 'bg-emerald-100 text-corporate-green border border-emerald-300'
+                                  : 'bg-slate-200 text-slate-600 border border-slate-300'
+                              }`}
+                            >
+                              <span
+                                className={`w-1.5 h-1.5 rounded-full ${
+                                  screen.is_online ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
+                                }`}
+                              />
+                              {screen.is_online ? 'Online' : 'Offline'}
                             </span>
                           </td>
-                          <td className="p-3 font-mono">
-                            {b.recurring_rule === 'FRIDAY_12_14' ? (
-                              <span className="text-corporate-red font-bold">
-                                Recurring: Every Friday 12:00 – 14:00 (Prayer & Maintenance)
-                              </span>
-                            ) : (
-                              <span>
-                                {formatInDubai(b.start_time, 'd MMM HH:mm')} –{' '}
-                                {formatInDubai(b.end_time, 'd MMM HH:mm')}
-                              </span>
-                            )}
+                          <td className="p-2.5 font-mono text-slate-500 text-[11px]">
+                            {screen.last_heartbeat_at
+                              ? formatInDubai(screen.last_heartbeat_at, 'HH:mm:ss')
+                              : 'Never'}
                           </td>
-                          <td className="p-3 text-slate-500">{b.created_by}</td>
-                          <td className="p-3 text-right">
-                            <Button
-                              size="sm"
-                              variant="danger"
-                              onClick={async () => {
-                                if (confirm(`Remove blocked slot "${b.title}"?`)) {
-                                  const res = await fetch(`/api/blocks/${b.id}`, { method: 'DELETE' });
-                                  if (res.ok) {
-                                    showNotify('Blocked slot deleted');
-                                    fetchAllData();
-                                  }
-                                }
-                              }}
-                            >
-                              <Trash2 className="w-3 h-3 mr-1" />
-                              Remove
-                            </Button>
+                          <td className="p-2.5 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 text-[10px] px-2"
+                                onClick={async () => {
+                                  const res = await fetch(`/api/screens/${screen.id}`, {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ action: 'RELOAD' }),
+                                  });
+                                  if (res.ok) showNotify('Reload signal dispatched');
+                                }}
+                              >
+                                Reload
+                              </Button>
+                              <Link href={`/display/${screen.room_id}`} target="_blank">
+                                <Button size="sm" variant="ghost" className="h-6 text-[10px] px-2 text-corporate-teal">
+                                  View
+                                </Button>
+                              </Link>
+                            </div>
                           </td>
                         </tr>
                       );
@@ -946,304 +1251,192 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             </div>
           )}
 
-          {/* TAB 6: DISPLAY SCREENS */}
-          {activeTab === 'screens' && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between bg-white p-4 rounded-sm border border-corporate-hairline">
-                <div>
-                  <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
-                    Wall Tablet &amp; Kiosk Displays
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Monitor media player heartbeats and issue remote reload commands
-                  </p>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Link href="/display-test" target="_blank">
-                    <Button size="sm" variant="outline">
-                      Diagnostic Test
-                    </Button>
-                  </Link>
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    onClick={() => setShowRegisterScreenModal(true)}
-                    className="bg-corporate-navy"
-                  >
-                    <Plus className="w-3.5 h-3.5 mr-1" />
-                    + Register Screen
-                  </Button>
-                </div>
+          {/* TAB 7: SETTINGS (Two-column layout, fits 100vh without scrollbar) */}
+          {activeTab === 'settings' && (
+            <div className="h-full flex flex-col gap-2.5 overflow-hidden">
+              <div className="bg-white p-2.5 rounded-sm border border-corporate-hairline shrink-0 shadow-2xs">
+                <h3 className="text-xs font-bold text-corporate-navy uppercase tracking-wider">
+                  System Parameters & Security
+                </h3>
+                <p className="text-[11px] text-slate-500">
+                  Global booking rules, working hours, auto-lock timeout, and administrative credentials.
+                </p>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {screens.map((screen) => {
-                  const targetRoom = rooms.find((r) => r.id === screen.room_id);
-                  return (
-                    <div
-                      key={screen.id}
-                      className="bg-white p-5 rounded-sm border border-corporate-hairline shadow-xs flex flex-col justify-between"
-                    >
-                      <div>
-                        <div className="flex items-start justify-between">
-                          <div>
-                            <h4 className="text-sm font-bold text-corporate-navy">{screen.name}</h4>
-                            <p className="text-xs text-slate-500 mt-0.5">
-                              Room: <span className="font-semibold">{targetRoom?.name}</span>
-                            </p>
-                          </div>
-                          <Badge variant={screen.is_online ? 'available' : 'unavailable'}>
-                            <span
-                              className={`w-2 h-2 rounded-full mr-1 ${
-                                screen.is_online ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'
-                              }`}
-                            />
-                            {screen.is_online ? 'Online' : 'Offline'}
-                          </Badge>
-                        </div>
+              <div className="flex-1 min-h-0 grid grid-cols-2 gap-3 overflow-hidden">
+                {/* Column 1: Booking Rules */}
+                <form
+                  id="settings-form"
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const form = e.currentTarget;
+                    const work_start_hour = parseInt((form.elements.namedItem('work_start') as HTMLInputElement).value, 10);
+                    const work_end_hour = parseInt((form.elements.namedItem('work_end') as HTMLInputElement).value, 10);
+                    const slot_duration_minutes = parseInt((form.elements.namedItem('slot_duration') as HTMLInputElement).value, 10);
+                    const max_booking_duration_hours = parseInt((form.elements.namedItem('max_duration') as HTMLInputElement).value, 10);
+                    const max_advance_booking_days = parseInt((form.elements.namedItem('max_advance') as HTMLInputElement).value, 10);
+                    const inactivity_lock_minutes = parseInt((form.elements.namedItem('inactivity_lock') as HTMLInputElement).value, 10);
+                    const privacy_mode = (form.elements.namedItem('privacy_mode') as HTMLInputElement).checked;
 
-                        <div className="my-3 space-y-1 text-xs text-slate-600 font-mono">
-                          <div>IP: {screen.media_player_ip || 'DHCP (Awaiting heartbeat)'}</div>
-                          <div>Orientation: {screen.orientation}</div>
-                          <div>
-                            Heartbeat:{' '}
-                            {screen.last_heartbeat_at
-                              ? formatInDubai(screen.last_heartbeat_at, 'HH:mm:ss')
-                              : 'None'}
-                          </div>
-                        </div>
-                      </div>
+                    const res = await fetch('/api/settings', {
+                      method: 'PATCH',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        work_start_hour,
+                        work_end_hour,
+                        slot_duration_minutes,
+                        max_booking_duration_hours,
+                        max_advance_booking_days,
+                        inactivity_lock_minutes,
+                        privacy_mode,
+                      }),
+                    });
 
-                      <div className="pt-3 border-t border-corporate-hairline flex items-center justify-between gap-2">
-                        <Link href={`/display/${screen.room_id}`} target="_blank">
-                          <Button size="sm" variant="outline">
-                            Preview Display
-                          </Button>
-                        </Link>
+                    if (res.ok) {
+                      showNotify('Settings updated successfully');
+                      fetchAllData();
+                    }
+                  }}
+                  className="bg-white p-4 rounded-sm border border-corporate-hairline shadow-2xs flex flex-col justify-between overflow-hidden"
+                >
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-bold text-corporate-navy uppercase tracking-wider border-b pb-1.5">
+                      Working Hours & Policy
+                    </h4>
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <Input
+                        id="set-work-start"
+                        name="work_start"
+                        label="Work Start (Hour)"
+                        type="number"
+                        min={0}
+                        max={23}
+                        defaultValue={settings.work_start_hour}
+                        required
+                        className="h-8 text-xs"
+                      />
+                      <Input
+                        id="set-work-end"
+                        name="work_end"
+                        label="Work End (Hour)"
+                        type="number"
+                        min={1}
+                        max={24}
+                        defaultValue={settings.work_end_hour}
+                        required
+                        className="h-8 text-xs"
+                      />
+                    </div>
 
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <Input
+                        id="set-slot-duration"
+                        name="slot_duration"
+                        label="Slot Duration (Minutes)"
+                        type="number"
+                        step={15}
+                        min={15}
+                        max={120}
+                        defaultValue={settings.slot_duration_minutes}
+                        required
+                        className="h-8 text-xs"
+                      />
+                      <Input
+                        id="set-max-duration"
+                        name="max_duration"
+                        label="Max Duration (Hours)"
+                        type="number"
+                        min={1}
+                        max={12}
+                        defaultValue={settings.max_booking_duration_hours}
+                        required
+                        className="h-8 text-xs"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <Input
+                        id="set-max-advance"
+                        name="max_advance"
+                        label="Max Advance (Days)"
+                        type="number"
+                        min={1}
+                        max={180}
+                        defaultValue={settings.max_advance_booking_days}
+                        required
+                        className="h-8 text-xs"
+                      />
+                      <Input
+                        id="set-inactivity-lock"
+                        name="inactivity_lock"
+                        label="Inactivity Timeout (Mins)"
+                        type="number"
+                        min={1}
+                        max={120}
+                        defaultValue={settings.inactivity_lock_minutes}
+                        required
+                        className="h-8 text-xs"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-corporate-hairline flex items-center justify-between">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        name="privacy_mode"
+                        defaultChecked={settings.privacy_mode}
+                        className="w-4 h-4 rounded text-corporate-teal"
+                      />
+                      <span className="text-xs font-semibold text-corporate-charcoal">Privacy Mode</span>
+                    </label>
+                    <Button type="submit" variant="primary" size="sm" className="h-7 text-xs bg-corporate-navy">
+                      Save Parameters
+                    </Button>
+                  </div>
+                </form>
+
+                {/* Column 2: Credentials & Admin Security */}
+                <div className="bg-white p-4 rounded-sm border border-corporate-hairline shadow-2xs flex flex-col justify-between overflow-hidden">
+                  <div className="space-y-3">
+                    <h4 className="text-xs font-bold text-corporate-navy uppercase tracking-wider border-b pb-1.5">
+                      Receptionist & Admin Authentication
+                    </h4>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      This application enforces single-admin access. Passwords are protected against brute force with a
+                      5-failed-attempts lockout (15-minute freeze).
+                    </p>
+
+                    <div className="p-3 bg-slate-50 rounded-xs border border-corporate-hairline space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-corporate-navy">Admin Password</span>
                         <Button
                           size="sm"
-                          variant="secondary"
-                          onClick={async () => {
-                            const res = await fetch(`/api/screens/${screen.id}`, {
-                              method: 'PATCH',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({ action: 'reload' }),
-                            });
-                            if (res.ok) {
-                              showNotify('Remote reload command issued to display');
-                            }
-                          }}
+                          variant="outline"
+                          className="h-7 text-xs"
+                          onClick={() => setShowChangePasswordModal(true)}
                         >
-                          <RefreshCw className="w-3 h-3 mr-1" />
-                          Reload
+                          Change Password
+                        </Button>
+                      </div>
+                      <div className="flex items-center justify-between pt-2 border-t border-slate-200">
+                        <span className="text-xs font-bold text-corporate-navy">Quick-Unlock PIN</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs"
+                          onClick={() => setShowChangePinModal(true)}
+                        >
+                          Change PIN
                         </Button>
                       </div>
                     </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* TAB 7: QR SIGNS */}
-          {activeTab === 'qrcodes' && (
-            <div className="space-y-4">
-              <div className="bg-white p-4 rounded-sm border border-corporate-hairline">
-                <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
-                  Room QR Signs (Printable A4 / Tabloid)
-                </h3>
-                <p className="text-xs text-slate-500">
-                  Print official signage to place outside each meeting room. Each sign directs
-                  smartphones to http://192.168.50.143/room/&#123;roomId&#125;.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {rooms.map((room) => (
-                  <div
-                    key={room.id}
-                    className="bg-white p-6 rounded-sm border border-corporate-hairline shadow-xs flex flex-col items-center text-center justify-between"
-                  >
-                    <div className="w-full">
-                      <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">
-                        Official Signage
-                      </span>
-                      <h4 className="text-lg font-black text-corporate-navy mt-1">{room.name}</h4>
-                      <p className="text-xs text-slate-500">{room.location}</p>
-
-                      <div className="my-6 p-4 bg-white border border-corporate-hairline rounded-sm inline-block shadow-2xs">
-                        <img
-                          src={`/api/rooms/${room.id}?date=today`}
-                          alt=""
-                          className="hidden"
-                        />
-                        <div className="w-40 h-40 flex items-center justify-center bg-slate-50 border border-slate-200">
-                          <QrCode className="w-24 h-24 text-corporate-navy" />
-                        </div>
-                      </div>
-
-                      <p className="text-[11px] font-mono text-slate-600">
-                        http://192.168.50.143/room/{room.id}
-                      </p>
-                    </div>
-
-                    <div className="w-full pt-4 border-t border-corporate-hairline mt-4">
-                      <Link href={`/room/${room.id}/print`} target="_blank" className="w-full block">
-                        <Button variant="primary" size="sm" className="w-full bg-corporate-navy">
-                          <Printer className="w-3.5 h-3.5 mr-1.5" />
-                          Print A4 Sign
-                        </Button>
-                      </Link>
-                    </div>
                   </div>
-                ))}
-              </div>
-            </div>
-          )}
 
-          {/* TAB 8: AUDIT TRAIL */}
-          {activeTab === 'audit' && (
-            <div className="space-y-4">
-              <div className="flex items-center justify-between bg-white p-4 rounded-sm border border-corporate-hairline">
-                <div>
-                  <h3 className="text-sm font-bold text-corporate-navy uppercase tracking-wider">
-                    Security Audit Trail
-                  </h3>
-                  <p className="text-xs text-slate-500">
-                    Chronological activity log recorded on the local Windows Server
-                  </p>
-                </div>
-                <Button size="sm" variant="outline" onClick={fetchAuditLogs}>
-                  <RefreshCw className="w-3.5 h-3.5 mr-1" />
-                  Refresh Logs
-                </Button>
-              </div>
-
-              <div className="bg-white border border-corporate-hairline rounded-sm overflow-x-auto shadow-xs">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-corporate-offwhite border-b border-corporate-hairline text-corporate-charcoal uppercase tracking-wider text-[10px]">
-                      <th className="p-3">Timestamp (Dubai)</th>
-                      <th className="p-3">Action</th>
-                      <th className="p-3">Actor</th>
-                      <th className="p-3">IP Address</th>
-                      <th className="p-3">Details</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-corporate-hairline font-mono text-[11px]">
-                    {auditLogs.map((log) => (
-                      <tr key={log.id} className="hover:bg-slate-50">
-                        <td className="p-3 text-slate-500">
-                          {formatInDubai(log.created_at, 'yyyy-MM-dd HH:mm:ss')}
-                        </td>
-                        <td className="p-3 font-bold text-corporate-navy">{log.action}</td>
-                        <td className="p-3 font-semibold text-corporate-teal">{log.actor}</td>
-                        <td className="p-3 text-slate-600">{log.ip_address}</td>
-                        <td className="p-3 text-slate-600 max-w-md truncate font-sans text-xs">
-                          {typeof log.details === 'object'
-                            ? JSON.stringify(log.details)
-                            : log.details || '-'}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {/* TAB 9: SETTINGS */}
-          {activeTab === 'settings' && (
-            <div className="max-w-2xl bg-white p-6 rounded-sm border border-corporate-hairline shadow-xs space-y-6">
-              <div>
-                <h3 className="text-base font-bold text-corporate-navy">System Configuration</h3>
-                <p className="text-xs text-slate-500">
-                  Control facility hours, slot lengths, and security controls
-                </p>
-              </div>
-
-              <div className="space-y-4 text-xs">
-                <div className="flex items-center justify-between p-3 bg-corporate-offwhite rounded-sm border border-corporate-hairline">
-                  <div>
-                    <span className="font-bold text-corporate-charcoal block">
-                      Operating Working Hours
-                    </span>
-                    <span className="text-slate-500">
-                      Standard availability window for timeline bookings
-                    </span>
+                  <div className="p-3 bg-teal-50/60 rounded-xs border border-teal-200 text-xs text-corporate-navy font-mono">
+                    Fixed Internal IP: 192.168.50.143:3005 • Asia/Dubai (UTC+4)
                   </div>
-                  <span className="font-mono font-bold text-corporate-navy">
-                    {settings.work_start_hour}:00 – {settings.work_end_hour}:00 (Dubai Time)
-                  </span>
                 </div>
-
-                <div className="flex items-center justify-between p-3 bg-corporate-offwhite rounded-sm border border-corporate-hairline">
-                  <div>
-                    <span className="font-bold text-corporate-charcoal block">Timeline Slot Length</span>
-                    <span className="text-slate-500">Fixed reservation increment</span>
-                  </div>
-                  <span className="font-mono font-bold text-corporate-navy">
-                    {settings.slot_duration_minutes} minutes
-                  </span>
-                </div>
-
-                <div className="flex items-center justify-between p-3 bg-corporate-offwhite rounded-sm border border-corporate-hairline">
-                  <div>
-                    <span className="font-bold text-corporate-charcoal block">Privacy Mode</span>
-                    <span className="text-slate-500">
-                      Mask meeting titles and employee names as &apos;Booked&apos; for public visitors
-                    </span>
-                  </div>
-                  <Button
-                    size="sm"
-                    variant={settings.privacy_mode ? 'primary' : 'outline'}
-                    onClick={async () => {
-                      const res = await fetch('/api/settings', {
-                        method: 'PATCH',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ privacy_mode: !settings.privacy_mode }),
-                      });
-                      if (res.ok) {
-                        setSettings((prev) => ({ ...prev, privacy_mode: !prev.privacy_mode }));
-                        showNotify('Privacy mode updated');
-                      }
-                    }}
-                  >
-                    {settings.privacy_mode ? 'Enabled' : 'Disabled'}
-                  </Button>
-                </div>
-
-                <div className="flex items-center justify-between p-3 bg-corporate-offwhite rounded-sm border border-corporate-hairline">
-                  <div>
-                    <span className="font-bold text-corporate-charcoal block">
-                      Console Inactivity Lock
-                    </span>
-                    <span className="text-slate-500">
-                      Require quick PIN unlock after idle timeout
-                    </span>
-                  </div>
-                  <span className="font-mono font-bold text-corporate-navy">
-                    {settings.inactivity_lock_minutes} minutes
-                  </span>
-                </div>
-              </div>
-
-              <div className="pt-4 border-t border-corporate-hairline flex items-center gap-3">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setShowChangePasswordModal(true)}
-                >
-                  Change Admin Password
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setShowChangePinModal(true)}
-                >
-                  Update Quick PIN
-                </Button>
               </div>
             </div>
           )}
@@ -1255,7 +1448,7 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         isOpen={showAddRoomModal}
         onClose={() => setShowAddRoomModal(false)}
         title="Add Meeting Room"
-        description="Creates a new facility and generates permanent URL and QR code."
+        description="Creates a new facility and permanent booking URL."
       >
         <form
           onSubmit={async (e) => {
@@ -1263,17 +1456,9 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             const form = e.currentTarget;
             const name = (form.elements.namedItem('room_name') as HTMLInputElement).value;
             const location = (form.elements.namedItem('room_location') as HTMLInputElement).value;
-            const capacity = parseInt(
-              (form.elements.namedItem('room_capacity') as HTMLInputElement).value,
-              10
-            );
-            const amenitiesStr = (
-              form.elements.namedItem('room_amenities') as HTMLInputElement
-            ).value;
-            const amenities = amenitiesStr
-              .split(',')
-              .map((s) => s.trim())
-              .filter(Boolean);
+            const capacity = parseInt((form.elements.namedItem('room_capacity') as HTMLInputElement).value, 10);
+            const amenitiesStr = (form.elements.namedItem('room_amenities') as HTMLInputElement).value;
+            const amenities = amenitiesStr.split(',').map((s) => s.trim()).filter(Boolean);
 
             const res = await fetch('/api/rooms', {
               method: 'POST',
@@ -1289,43 +1474,12 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
           }}
           className="space-y-4"
         >
-          <Input
-            id="add-room-name"
-            name="room_name"
-            label="Room Name"
-            placeholder="e.g. Meeting Room 6"
-            defaultValue={`Meeting Room ${rooms.length + 1}`}
-            required
-          />
-          <Input
-            id="add-room-location"
-            name="room_location"
-            label="Location / Floor"
-            placeholder="e.g. Floor 4, Innovation Wing"
-            required
-          />
-          <Input
-            id="add-room-capacity"
-            name="room_capacity"
-            label="Seating Capacity"
-            type="number"
-            min={1}
-            defaultValue={8}
-            required
-          />
-          <Input
-            id="add-room-amenities"
-            name="room_amenities"
-            label="Amenities (Comma Separated)"
-            placeholder="4K Screen, Video Bar, Whiteboard"
-          />
-          <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowAddRoomModal(false)}
-            >
+          <Input id="add-room-name" name="room_name" label="Room Name" defaultValue={`Meeting Room ${rooms.length + 1}`} required />
+          <Input id="add-room-location" name="room_location" label="Location / Floor" placeholder="e.g. Floor 2, East Wing" required />
+          <Input id="add-room-capacity" name="room_capacity" label="Capacity" type="number" min={1} defaultValue={8} required />
+          <Input id="add-room-amenities" name="room_amenities" label="Amenities" placeholder="4K Screen, Video Bar" />
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowAddRoomModal(false)}>
               Cancel
             </Button>
             <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
@@ -1351,17 +1505,9 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
               const form = e.currentTarget;
               const name = (form.elements.namedItem('edit_name') as HTMLInputElement).value;
               const location = (form.elements.namedItem('edit_location') as HTMLInputElement).value;
-              const capacity = parseInt(
-                (form.elements.namedItem('edit_capacity') as HTMLInputElement).value,
-                10
-              );
-              const amenitiesStr = (
-                form.elements.namedItem('edit_amenities') as HTMLInputElement
-              ).value;
-              const amenities = amenitiesStr
-                .split(',')
-                .map((s) => s.trim())
-                .filter(Boolean);
+              const capacity = parseInt((form.elements.namedItem('edit_capacity') as HTMLInputElement).value, 10);
+              const amenitiesStr = (form.elements.namedItem('edit_amenities') as HTMLInputElement).value;
+              const amenities = amenitiesStr.split(',').map((s) => s.trim()).filter(Boolean);
 
               const res = await fetch(`/api/rooms/${editingRoom.id}`, {
                 method: 'PATCH',
@@ -1378,41 +1524,12 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             }}
             className="space-y-4"
           >
-            <Input
-              id="edit-room-name"
-              name="edit_name"
-              label="Room Name"
-              defaultValue={editingRoom.name}
-              required
-            />
-            <Input
-              id="edit-room-location"
-              name="edit_location"
-              label="Location"
-              defaultValue={editingRoom.location}
-              required
-            />
-            <Input
-              id="edit-room-capacity"
-              name="edit_capacity"
-              label="Capacity"
-              type="number"
-              defaultValue={editingRoom.capacity}
-              required
-            />
-            <Input
-              id="edit-room-amenities"
-              name="edit_amenities"
-              label="Amenities"
-              defaultValue={editingRoom.amenities?.join(', ')}
-            />
-            <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                onClick={() => setShowEditRoomModal(false)}
-              >
+            <Input id="edit-room-name" name="edit_name" label="Room Name" defaultValue={editingRoom.name} required />
+            <Input id="edit-room-location" name="edit_location" label="Location" defaultValue={editingRoom.location} required />
+            <Input id="edit-room-capacity" name="edit_capacity" label="Capacity" type="number" defaultValue={editingRoom.capacity} required />
+            <Input id="edit-room-amenities" name="edit_amenities" label="Amenities" defaultValue={editingRoom.amenities?.join(', ')} />
+            <div className="flex justify-end gap-2 pt-2 border-t">
+              <Button type="button" variant="ghost" size="sm" onClick={() => setShowEditRoomModal(false)}>
                 Cancel
               </Button>
               <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
@@ -1428,7 +1545,7 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         isOpen={showBookOnBehalfModal}
         onClose={() => setShowBookOnBehalfModal(false)}
         title="Admin: Book on Behalf"
-        description="Schedule a meeting for an executive or team."
+        description="Schedule a meeting for an executive or department."
       >
         <form
           onSubmit={async (e) => {
@@ -1442,11 +1559,11 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             const startTimeStr = (form.elements.namedItem('bob_start') as HTMLInputElement).value;
             const endTimeStr = (form.elements.namedItem('bob_end') as HTMLInputElement).value;
 
-            // Form UTC strings from Dubai inputs
             const [sH, sM] = startTimeStr.split(':').map(Number);
             const [eH, eM] = endTimeStr.split(':').map(Number);
             const [y, m, d] = date.split('-').map(Number);
 
+            // Convert Dubai inputs to UTC
             const start_time = new Date(Date.UTC(y, m - 1, d, sH - 4, sM)).toISOString();
             const end_time = new Date(Date.UTC(y, m - 1, d, eH - 4, eM)).toISOString();
 
@@ -1464,76 +1581,42 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             });
 
             const data = await res.json();
-            if (!res.ok) {
-              alert(data.error || 'Failed to create booking');
-            } else {
-              showNotify('Reservation created on behalf');
+            if (res.ok) {
+              showNotify('Reservation confirmed successfully');
               setShowBookOnBehalfModal(false);
               fetchAllData();
+            } else {
+              alert(data.error || 'Failed to create booking');
             }
           }}
-          className="space-y-4"
+          className="space-y-3"
         >
           <div>
-            <label className="block text-xs font-semibold uppercase text-corporate-charcoal mb-1">
-              Select Room
-            </label>
+            <label className="text-xs font-semibold text-corporate-charcoal mb-1 block">Meeting Room</label>
             <select
               name="bob_room"
               required
-              className="w-full h-10 px-3 text-xs border border-corporate-hairline rounded-sm bg-white"
+              className="w-full h-9 px-3 text-xs border border-corporate-hairline rounded-sm bg-white"
             >
               {rooms.map((r) => (
                 <option key={r.id} value={r.id}>
-                  {r.name} ({r.location})
+                  {r.name} (Cap: {r.capacity})
                 </option>
               ))}
             </select>
           </div>
-
-          <Input
-            id="bob-title"
-            name="bob_title"
-            label="Meeting Title"
-            placeholder="Executive Board Sync"
-            required
-          />
-          <Input
-            id="bob-name"
-            name="bob_name"
-            label="Organizer Full Name"
-            placeholder="Elena Rostova"
-            required
-          />
-          <Input
-            id="bob-email"
-            name="bob_email"
-            label="Organizer Work Email"
-            type="email"
-            placeholder="elena.r@company.internal"
-            required
-          />
-
-          <div className="grid grid-cols-3 gap-2">
-            <Input
-              id="bob-date"
-              name="bob_date"
-              label="Date"
-              type="date"
-              defaultValue={formatInDubai(new Date(), 'yyyy-MM-dd')}
-              required
-            />
-            <Input id="bob-start" name="bob_start" label="Start Time" type="time" defaultValue="10:00" required />
-            <Input id="bob-end" name="bob_end" label="End Time" type="time" defaultValue="11:00" required />
+          <Input id="bob-title" name="bob_title" label="Meeting Title" placeholder="e.g. Quarterly Executive Review" required />
+          <div className="grid grid-cols-2 gap-2">
+            <Input id="bob-name" name="bob_name" label="Organizer Name" placeholder="e.g. Director Sarah" required />
+            <Input id="bob-email" name="bob_email" label="Organizer Email" type="email" placeholder="sarah@internal.net" required />
           </div>
-
-          <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowBookOnBehalfModal(false)}
-            >
+          <Input id="bob-date" name="bob_date" label="Date" type="date" defaultValue={scheduleDate} required />
+          <div className="grid grid-cols-2 gap-2">
+            <Input id="bob-start" name="bob_start" label="Start Time (Dubai)" type="time" defaultValue="09:00" required />
+            <Input id="bob-end" name="bob_end" label="End Time (Dubai)" type="time" defaultValue="10:00" required />
+          </div>
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowBookOnBehalfModal(false)}>
               Cancel
             </Button>
             <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
@@ -1543,118 +1626,173 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         </form>
       </Modal>
 
-      {/* MODAL: BLOCK TIME SLOT */}
+      {/* MODAL: EDIT / MOVE BOOKING */}
+      <Modal
+        isOpen={showEditBookingModal}
+        onClose={() => {
+          setShowEditBookingModal(false);
+          setEditingBooking(null);
+        }}
+        title={`Edit Booking: ${editingBooking?.title || ''}`}
+      >
+        {editingBooking && (
+          <form
+            onSubmit={async (e) => {
+              e.preventDefault();
+              const form = e.currentTarget;
+              const room_id = (form.elements.namedItem('edit_b_room') as HTMLSelectElement).value;
+              const title = (form.elements.namedItem('edit_b_title') as HTMLInputElement).value;
+              const organizer_name = (form.elements.namedItem('edit_b_name') as HTMLInputElement).value;
+              const date = (form.elements.namedItem('edit_b_date') as HTMLInputElement).value;
+              const startStr = (form.elements.namedItem('edit_b_start') as HTMLInputElement).value;
+              const endStr = (form.elements.namedItem('edit_b_end') as HTMLInputElement).value;
+
+              const [sH, sM] = startStr.split(':').map(Number);
+              const [eH, eM] = endStr.split(':').map(Number);
+              const [y, m, d] = date.split('-').map(Number);
+
+              const start_time = new Date(Date.UTC(y, m - 1, d, sH - 4, sM)).toISOString();
+              const end_time = new Date(Date.UTC(y, m - 1, d, eH - 4, eM)).toISOString();
+
+              const res = await fetch(`/api/bookings/${editingBooking.id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ room_id, title, organizer_name, start_time, end_time }),
+              });
+
+              const data = await res.json();
+              if (res.ok) {
+                showNotify('Booking updated successfully');
+                setShowEditBookingModal(false);
+                setEditingBooking(null);
+                fetchAllData();
+              } else {
+                alert(data.error || 'Failed to update booking');
+              }
+            }}
+            className="space-y-3"
+          >
+            <div>
+              <label className="text-xs font-semibold text-corporate-charcoal mb-1 block">Room</label>
+              <select
+                name="edit_b_room"
+                defaultValue={editingBooking.room_id}
+                className="w-full h-9 px-3 text-xs border border-corporate-hairline rounded-sm bg-white"
+              >
+                {rooms.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {r.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <Input id="edit-b-title" name="edit_b_title" label="Title" defaultValue={editingBooking.title} required />
+            <Input id="edit-b-name" name="edit_b_name" label="Organizer" defaultValue={editingBooking.organizer_name} required />
+            <Input
+              id="edit-b-date"
+              name="edit_b_date"
+              label="Date"
+              type="date"
+              defaultValue={formatInDubai(editingBooking.start_time, 'yyyy-MM-dd')}
+              required
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <Input
+                id="edit-b-start"
+                name="edit_b_start"
+                label="Start Time"
+                type="time"
+                defaultValue={formatInDubai(editingBooking.start_time, 'HH:mm')}
+                required
+              />
+              <Input
+                id="edit-b-end"
+                name="edit_b_end"
+                label="End Time"
+                type="time"
+                defaultValue={formatInDubai(editingBooking.end_time, 'HH:mm')}
+                required
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t">
+              <Button type="button" variant="ghost" size="sm" onClick={() => setShowEditBookingModal(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
+                Save Changes
+              </Button>
+            </div>
+          </form>
+        )}
+      </Modal>
+
+      {/* MODAL: ADD BLOCKED SLOT */}
       <Modal
         isOpen={showAddBlockModal}
         onClose={() => setShowAddBlockModal(false)}
-        title="Block Facility Time Slot"
-        description="Prevents employees from booking slots during maintenance, inspections, or breaks."
+        title="Block Time Slot"
+        description="Prevent employee bookings during maintenance or executive holds."
       >
         <form
           onSubmit={async (e) => {
             e.preventDefault();
             const form = e.currentTarget;
-            const room_id = (form.elements.namedItem('block_room') as HTMLSelectElement).value || null;
+            const roomVal = (form.elements.namedItem('block_room') as HTMLSelectElement).value;
+            const room_id = roomVal === 'ALL' ? null : roomVal;
             const title = (form.elements.namedItem('block_title') as HTMLInputElement).value;
-            const isRecurringFriday = (
-              form.elements.namedItem('block_recurring') as HTMLInputElement
-            ).checked;
+            const reason = (form.elements.namedItem('block_reason') as HTMLInputElement).value;
+            const date = (form.elements.namedItem('block_date') as HTMLInputElement).value;
+            const startStr = (form.elements.namedItem('block_start') as HTMLInputElement).value;
+            const endStr = (form.elements.namedItem('block_end') as HTMLInputElement).value;
 
-            let bodyPayload: any = {
-              room_id: room_id === 'ALL' ? null : room_id,
-              title,
-            };
+            const [sH, sM] = startStr.split(':').map(Number);
+            const [eH, eM] = endStr.split(':').map(Number);
+            const [y, m, d] = date.split('-').map(Number);
 
-            if (isRecurringFriday) {
-              bodyPayload.recurring_rule = 'FRIDAY_12_14';
-              bodyPayload.start_time = new Date().toISOString();
-              bodyPayload.end_time = new Date(Date.now() + 365 * 86400000).toISOString();
-            } else {
-              const date = (form.elements.namedItem('block_date') as HTMLInputElement).value;
-              const startT = (form.elements.namedItem('block_start') as HTMLInputElement).value;
-              const endT = (form.elements.namedItem('block_end') as HTMLInputElement).value;
-              const [sH, sM] = startT.split(':').map(Number);
-              const [eH, eM] = endT.split(':').map(Number);
-              const [y, m, d] = date.split('-').map(Number);
-              bodyPayload.start_time = new Date(Date.UTC(y, m - 1, d, sH - 4, sM)).toISOString();
-              bodyPayload.end_time = new Date(Date.UTC(y, m - 1, d, eH - 4, eM)).toISOString();
-            }
+            const start_time = new Date(Date.UTC(y, m - 1, d, sH - 4, sM)).toISOString();
+            const end_time = new Date(Date.UTC(y, m - 1, d, eH - 4, eM)).toISOString();
 
             const res = await fetch('/api/blocks', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(bodyPayload),
+              body: JSON.stringify({ room_id, title, reason, start_time, end_time }),
             });
 
-            const data = await res.json();
-            if (!res.ok) {
-              alert(data.error || 'Failed to block slot');
-            } else {
-              if (data.warning) {
-                alert(`Warning: ${data.warning}`);
-              }
-              showNotify('Facility slot blocked successfully');
+            if (res.ok) {
+              showNotify('Time slot blocked successfully');
               setShowAddBlockModal(false);
               fetchAllData();
+            } else {
+              const err = await res.json();
+              alert(err.error || 'Failed to create block');
             }
           }}
-          className="space-y-4"
+          className="space-y-3"
         >
           <div>
-            <label className="block text-xs font-semibold uppercase text-corporate-charcoal mb-1">
-              Target Facility
-            </label>
-            <select
-              name="block_room"
-              className="w-full h-10 px-3 text-xs border border-corporate-hairline rounded-sm bg-white"
-            >
-              <option value="ALL">Apply to ALL 5 Meeting Rooms</option>
+            <label className="text-xs font-semibold text-corporate-charcoal mb-1 block">Scope</label>
+            <select name="block_room" className="w-full h-9 px-3 text-xs border border-corporate-hairline rounded-sm bg-white">
+              <option value="ALL">ALL MEETING ROOMS (Global Block)</option>
               {rooms.map((r) => (
                 <option key={r.id} value={r.id}>
-                  {r.name}
+                  {r.name} only
                 </option>
               ))}
             </select>
           </div>
-
-          <Input
-            id="block-title"
-            name="block_title"
-            label="Block Reason"
-            placeholder="e.g. Projector Replacement / AC Service"
-            required
-          />
-
-          <div className="p-3 bg-corporate-offwhite border border-corporate-hairline rounded-sm">
-            <label className="flex items-center gap-2 text-xs font-semibold cursor-pointer">
-              <input type="checkbox" name="block_recurring" defaultChecked={false} className="w-4 h-4" />
-              <span>Recurring Friday Prayer (12:00 – 14:00 Dubai Time)</span>
-            </label>
+          <Input id="block-title" name="block_title" label="Block Title" placeholder="e.g. Deep Cleaning / Audio Calibration" required />
+          <Input id="block-reason" name="block_reason" label="Reason (Optional)" placeholder="e.g. Facilities maintenance team" />
+          <Input id="block-date" name="block_date" label="Date" type="date" defaultValue={scheduleDate} required />
+          <div className="grid grid-cols-2 gap-2">
+            <Input id="block-start" name="block_start" label="Start Time (Dubai)" type="time" defaultValue="12:00" required />
+            <Input id="block-end" name="block_end" label="End Time (Dubai)" type="time" defaultValue="14:00" required />
           </div>
-
-          <div className="grid grid-cols-3 gap-2">
-            <Input
-              id="block-date"
-              name="block_date"
-              label="Date"
-              type="date"
-              defaultValue={formatInDubai(new Date(), 'yyyy-MM-dd')}
-            />
-            <Input id="block-start" name="block_start" label="Start Time" type="time" defaultValue="12:00" />
-            <Input id="block-end" name="block_end" label="End Time" type="time" defaultValue="14:00" />
-          </div>
-
-          <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowAddBlockModal(false)}
-            >
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowAddBlockModal(false)}>
               Cancel
             </Button>
-            <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
-              Block Slot
+            <Button type="submit" variant="primary" size="sm" className="bg-corporate-red">
+              Apply Block
             </Button>
           </div>
         </form>
@@ -1665,7 +1803,6 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         isOpen={showRegisterScreenModal}
         onClose={() => setShowRegisterScreenModal(false)}
         title="Register Wall Display Screen"
-        description="Connect a tablet or media player outside a room."
       >
         <form
           onSubmit={async (e) => {
@@ -1673,8 +1810,7 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             const form = e.currentTarget;
             const name = (form.elements.namedItem('screen_name') as HTMLInputElement).value;
             const room_id = (form.elements.namedItem('screen_room') as HTMLSelectElement).value;
-            const orientation = (form.elements.namedItem('screen_orientation') as HTMLSelectElement)
-              .value;
+            const orientation = (form.elements.namedItem('screen_orientation') as HTMLSelectElement).value as any;
 
             const res = await fetch('/api/screens', {
               method: 'POST',
@@ -1683,29 +1819,17 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             });
 
             if (res.ok) {
-              showNotify('Display screen registered');
+              showNotify('Display registered');
               setShowRegisterScreenModal(false);
               fetchAllData();
             }
           }}
-          className="space-y-4"
+          className="space-y-3"
         >
-          <Input
-            id="screen-name"
-            name="screen_name"
-            label="Display Device Name"
-            placeholder="e.g. Meeting Room 1 Wall Tablet"
-            required
-          />
+          <Input id="screen-name" name="screen_name" label="Display Screen Name" placeholder="e.g. Meeting Room 1 Tablet" required />
           <div>
-            <label className="block text-xs font-semibold uppercase text-corporate-charcoal mb-1">
-              Mounted Outside Room
-            </label>
-            <select
-              name="screen_room"
-              required
-              className="w-full h-10 px-3 text-xs border border-corporate-hairline rounded-sm bg-white"
-            >
+            <label className="text-xs font-semibold text-corporate-charcoal mb-1 block">Associated Room</label>
+            <select name="screen_room" className="w-full h-9 px-3 text-xs border border-corporate-hairline rounded-sm bg-white" required>
               {rooms.map((r) => (
                 <option key={r.id} value={r.id}>
                   {r.name}
@@ -1714,25 +1838,14 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
             </select>
           </div>
           <div>
-            <label className="block text-xs font-semibold uppercase text-corporate-charcoal mb-1">
-              Screen Orientation
-            </label>
-            <select
-              name="screen_orientation"
-              defaultValue="landscape"
-              className="w-full h-10 px-3 text-xs border border-corporate-hairline rounded-sm bg-white"
-            >
-              <option value="landscape">Landscape (16:9)</option>
-              <option value="portrait">Portrait (9:16)</option>
+            <label className="text-xs font-semibold text-corporate-charcoal mb-1 block">Orientation</label>
+            <select name="screen_orientation" className="w-full h-9 px-3 text-xs border border-corporate-hairline rounded-sm bg-white">
+              <option value="landscape">Landscape (Horizontal)</option>
+              <option value="portrait">Portrait (Vertical)</option>
             </select>
           </div>
-          <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowRegisterScreenModal(false)}
-            >
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowRegisterScreenModal(false)}>
               Cancel
             </Button>
             <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
@@ -1742,61 +1855,50 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
         </form>
       </Modal>
 
-      {/* MODAL: CHANGE PASSWORD */}
+      {/* MODAL: CHANGE ADMIN PASSWORD */}
       <Modal
         isOpen={showChangePasswordModal}
         onClose={() => setShowChangePasswordModal(false)}
-        title="Update Receptionist Admin Password"
+        title="Change Admin Password"
       >
         <form
           onSubmit={async (e) => {
             e.preventDefault();
             const form = e.currentTarget;
-            const current_password = (
-              form.elements.namedItem('curr_pass') as HTMLInputElement
-            ).value;
-            const new_password = (form.elements.namedItem('new_pass') as HTMLInputElement).value;
+            const currentPassword = (form.elements.namedItem('current_pass') as HTMLInputElement).value;
+            const newPassword = (form.elements.namedItem('new_pass') as HTMLInputElement).value;
+            const confirmPassword = (form.elements.namedItem('confirm_pass') as HTMLInputElement).value;
+
+            if (newPassword !== confirmPassword) {
+              alert('New passwords do not match');
+              return;
+            }
 
             const res = await fetch('/api/auth/change-password', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ current_password, new_password }),
+              body: JSON.stringify({ currentPassword, newPassword }),
             });
+
             const data = await res.json();
-            if (!res.ok) {
-              alert(data.error || 'Failed to update password');
-            } else {
+            if (res.ok) {
               showNotify('Password updated successfully');
               setShowChangePasswordModal(false);
+            } else {
+              alert(data.error || 'Failed to update password');
             }
           }}
-          className="space-y-4"
+          className="space-y-3"
         >
-          <Input
-            id="curr-pass"
-            name="curr_pass"
-            label="Current Password"
-            type="password"
-            required
-          />
-          <Input
-            id="new-pass"
-            name="new_pass"
-            label="New Password (min 8 chars)"
-            type="password"
-            required
-          />
-          <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowChangePasswordModal(false)}
-            >
+          <Input id="current-pass" name="current_pass" label="Current Password" type="password" required />
+          <Input id="new-pass" name="new_pass" label="New Password (min 8 chars)" type="password" minLength={8} required />
+          <Input id="confirm-pass" name="confirm_pass" label="Confirm New Password" type="password" minLength={8} required />
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowChangePasswordModal(false)}>
               Cancel
             </Button>
             <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
-              Save Password
+              Update Password
             </Button>
           </div>
         </form>
@@ -1806,59 +1908,44 @@ export function AdminConsoleClient({ initialRooms, initialSettings }: AdminConso
       <Modal
         isOpen={showChangePinModal}
         onClose={() => setShowChangePinModal(false)}
-        title="Update Quick Console PIN"
+        title="Change Quick-Unlock PIN"
       >
         <form
           onSubmit={async (e) => {
             e.preventDefault();
             const form = e.currentTarget;
-            const current_password = (
-              form.elements.namedItem('pin_curr_pass') as HTMLInputElement
-            ).value;
-            const new_pin = (form.elements.namedItem('pin_new') as HTMLInputElement).value;
+            const currentPassword = (form.elements.namedItem('pin_auth_pass') as HTMLInputElement).value;
+            const newPin = (form.elements.namedItem('new_pin') as HTMLInputElement).value;
+
+            if (!/^\d{4,6}$/.test(newPin)) {
+              alert('PIN must be 4 to 6 numeric digits');
+              return;
+            }
 
             const res = await fetch('/api/auth/change-pin', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ current_password, new_pin }),
+              body: JSON.stringify({ currentPassword, newPin }),
             });
+
             const data = await res.json();
-            if (!res.ok) {
-              alert(data.error || 'Failed to update PIN');
-            } else {
-              showNotify('Quick PIN updated successfully');
+            if (res.ok) {
+              showNotify('Quick-unlock PIN updated successfully');
               setShowChangePinModal(false);
+            } else {
+              alert(data.error || 'Failed to update PIN');
             }
           }}
-          className="space-y-4"
+          className="space-y-3"
         >
-          <Input
-            id="pin-curr-pass"
-            name="pin_curr_pass"
-            label="Current Admin Password"
-            type="password"
-            required
-          />
-          <Input
-            id="pin-new"
-            name="pin_new"
-            label="New PIN (4 to 6 Digits)"
-            type="password"
-            maxLength={6}
-            placeholder="1234"
-            required
-          />
-          <div className="flex justify-end gap-2 pt-2 border-t border-corporate-hairline">
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              onClick={() => setShowChangePinModal(false)}
-            >
+          <Input id="pin-auth-pass" name="pin_auth_pass" label="Current Admin Password" type="password" required />
+          <Input id="new-pin" name="new_pin" label="New PIN (4-6 digits)" type="password" maxLength={6} required />
+          <div className="flex justify-end gap-2 pt-2 border-t">
+            <Button type="button" variant="ghost" size="sm" onClick={() => setShowChangePinModal(false)}>
               Cancel
             </Button>
-            <Button type="submit" variant="primary" size="sm" className="bg-corporate-navy">
-              Save PIN
+            <Button type="submit" variant="primary" size="sm" className="bg-corporate-teal">
+              Update PIN
             </Button>
           </div>
         </form>

@@ -165,15 +165,10 @@ export function HomeClientView({ initialRooms }: HomeClientViewProps) {
                 </div>
 
                 <div className="p-4 bg-corporate-offwhite/50 border-t border-corporate-hairline flex items-center justify-between gap-2">
-                  <Link href={`/room/${room.id}`} className="flex-1">
+                  <Link href={`/room/${room.id}`} className="w-full">
                     <Button variant="primary" size="sm" className="w-full">
                       <span>View Schedule & Book</span>
                       <ArrowRight className="w-3.5 h-3.5 ml-1.5" />
-                    </Button>
-                  </Link>
-                  <Link href={`/room/${room.id}/print`} target="_blank">
-                    <Button variant="outline" size="sm" title="Printable Room QR Sign">
-                      <QrCode className="w-4 h-4 text-corporate-charcoal" />
                     </Button>
                   </Link>
                 </div>

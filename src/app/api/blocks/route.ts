@@ -7,7 +7,8 @@ export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const roomId = searchParams.get('roomId') || undefined;
-    const blocks = await Database.getBlockedSlots(roomId);
+    const dateStr = searchParams.get('date') || undefined;
+    const blocks = await Database.getBlockedSlots(roomId, dateStr);
     return NextResponse.json({ blocks });
   } catch (error: any) {
     return NextResponse.json({ error: error.message || 'Failed to fetch blocks' }, { status: 500 });

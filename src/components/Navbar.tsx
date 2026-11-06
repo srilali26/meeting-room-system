@@ -36,10 +36,10 @@ export function Navbar() {
   }, []);
 
   const isDisplayRoute = pathname.startsWith('/display');
-  const isPrintRoute = pathname.endsWith('/print');
+  const isAdminRoute = pathname.startsWith('/admin');
 
-  if (isDisplayRoute || isPrintRoute) {
-    return null; // Fullscreen tablet or print view
+  if (isDisplayRoute || isAdminRoute) {
+    return null; // Display kiosks and Admin console manage their own viewports
   }
 
   return (

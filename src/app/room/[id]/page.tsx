@@ -19,7 +19,7 @@ export default async function RoomPage({ params, searchParams }: RoomPageProps) 
 
   const todayStr = searchParams?.date || formatInDubai(new Date(), 'yyyy-MM-dd');
   const bookings = await Database.getBookings(room.id, todayStr);
-  const blockedSlots = await Database.getBlockedSlots(room.id);
+  const blockedSlots = await Database.getBlockedSlots(room.id, todayStr);
   const settings = await Database.getSettings();
 
   const slots = generateDaySlots(todayStr, bookings, blockedSlots, settings);

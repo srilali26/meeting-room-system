@@ -2,8 +2,8 @@
 
 import * as React from 'react';
 import { Room, RoomStatusInfo, Booking, BlockedSlot } from '@/types';
-import { formatInDubai, computeRoomStatus } from '@/lib/timezone';
-import { Clock, Users, MapPin, CheckCircle2, ShieldAlert, Wifi, QrCode } from 'lucide-react';
+import { formatInDubai, computeRoomStatus, isOverlappingDubaiDay } from '@/lib/timezone';
+import { Clock, Users, MapPin } from 'lucide-react';
 import { parseISO, isAfter } from 'date-fns';
 
 interface DisplayClientViewProps {
@@ -11,6 +11,7 @@ interface DisplayClientViewProps {
   qrDataUrl: string;
   initialBookings: Booking[];
   initialBlockedSlots: BlockedSlot[];
+  displayToken?: string;
 }
 
 export function DisplayClientView({
@@ -18,6 +19,7 @@ export function DisplayClientView({
   qrDataUrl,
   initialBookings,
   initialBlockedSlots,
+  displayToken = `token-screen-room-${room.id}`,
 }: DisplayClientViewProps) {
   const [dubaiTime, setDubaiTime] = React.useState<string>('');
   const [dubaiDate, setDubaiDate] = React.useState<string>('');
@@ -45,19 +47,21 @@ export function DisplayClientView({
         if ('wakeLock' in navigator) {
           wakeLock = await (navigator as any).wakeLock.request('screen');
         }
-      } catch (err) {
+      } catch {
         // Wake lock may not be allowed in all contexts
       }
     };
     requestWakeLock();
 
-    document.addEventListener('visibilitychange', () => {
+    const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         requestWakeLock();
       }
-    });
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       if (wakeLock) {
         wakeLock.release().catch(() => {});
       }
@@ -76,25 +80,31 @@ export function DisplayClientView({
     return () => clearInterval(timer);
   }, []);
 
-  // Fetch updated schedule
+  // Fetch updated schedule strictly for today in Dubai
   const refreshRoomData = React.useCallback(async () => {
     try {
-      const res = await fetch(`/api/rooms/${room.id}`);
-      if (res.ok) {
-        const data = await res.json();
-        const bRes = await fetch(`/api/bookings?roomId=${room.id}`);
-        if (bRes.ok) {
-          const bData = await bRes.json();
-          setBookings(bData.bookings);
-        }
-        setIsOnline(true);
+      const todayStr = formatInDubai(new Date(), 'yyyy-MM-dd');
+      const [rRes, bRes, blRes] = await Promise.all([
+        fetch(`/api/rooms/${room.id}?date=${todayStr}`),
+        fetch(`/api/bookings?roomId=${room.id}&date=${todayStr}`),
+        fetch(`/api/blocks?roomId=${room.id}&date=${todayStr}`),
+      ]);
+
+      if (bRes.ok) {
+        const bData = await bRes.json();
+        setBookings(bData.bookings || []);
       }
-    } catch (e) {
+      if (blRes.ok) {
+        const blData = await blRes.json();
+        setBlockedSlots(blData.blocks || []);
+      }
+      setIsOnline(true);
+    } catch {
       setIsOnline(false);
     }
   }, [room.id]);
 
-  // Real-time SSE listener + 30s Polling Fallback
+  // Real-time SSE listener + 30s Polling Fallback + Silent Background Heartbeat
   React.useEffect(() => {
     let es: EventSource | null = null;
     try {
@@ -104,31 +114,35 @@ export function DisplayClientView({
       es.addEventListener('rooms', () => refreshRoomData());
       es.onopen = () => setIsOnline(true);
       es.onerror = () => setIsOnline(false);
-    } catch (e) {
+    } catch {
       setIsOnline(false);
     }
 
     // Fallback polling every 30 seconds
     const fallbackTimer = setInterval(refreshRoomData, 30000);
 
-    // Heartbeat ping
-    const heartbeatTimer = setInterval(async () => {
+    // Silent background heartbeat to keep admin console Online/Offline accurate
+    const sendHeartbeat = async () => {
       try {
         const res = await fetch('/api/screens/heartbeat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: `token-screen-${room.id}` }),
+          body: JSON.stringify({ token: displayToken }),
         });
         if (res.ok) {
           const data = await res.json();
           if (data.reload_requested) {
             window.location.reload();
           }
+          setIsOnline(true);
         }
-      } catch (err) {
-        // Heartbeat error
+      } catch {
+        setIsOnline(false);
       }
-    }, 45000);
+    };
+
+    sendHeartbeat();
+    const heartbeatTimer = setInterval(sendHeartbeat, 45000);
 
     return () => {
       if (es) es.close();
@@ -140,66 +154,67 @@ export function DisplayClientView({
   const currentStatus = computeRoomStatus(bookings, blockedSlots);
   const isFree = currentStatus.state === 'available';
   const isOccupied = currentStatus.state === 'occupied';
-  const isBlocked = currentStatus.state === 'blocked';
 
-  // Next 3 meetings
+  // Next 3 meetings for TODAY in Dubai
   const now = new Date();
+  const todayDubaiStr = formatInDubai(now, 'yyyy-MM-dd');
   const nextMeetings = bookings
-    .filter((b) => b.status === 'confirmed' && isAfter(parseISO(b.end_time), now))
+    .filter(
+      (b) =>
+        b.status === 'confirmed' &&
+        isAfter(parseISO(b.end_time), now) &&
+        isOverlappingDubaiDay(b.start_time, b.end_time, todayDubaiStr)
+    )
     .sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime())
     .slice(0, 3);
 
   return (
-    <div className="fixed inset-0 bg-[#0B1F3A] text-white select-none overflow-hidden flex flex-col justify-between p-8 sm:p-12">
+    <div className="fixed inset-0 h-screen max-h-screen w-screen max-w-screen overflow-hidden bg-[#0B1F3A] text-white select-none flex flex-col justify-between p-4 sm:p-6 lg:p-8">
+      {/* Subtle Offline / Reconnecting Banner (Only visible when offline) */}
+      {!isOnline && (
+        <div className="absolute top-3 right-3 z-50 flex items-center gap-2 px-3 py-1 rounded bg-amber-500/20 border border-amber-500/40 text-amber-200 text-xs font-semibold backdrop-blur-xs">
+          <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+          Reconnecting...
+        </div>
+      )}
+
       {/* Top Header: Room Name, Location & Live Clock */}
-      <header className="flex items-start justify-between border-b border-white/10 pb-6">
+      <header className="flex items-center justify-between border-b border-white/10 pb-3 sm:pb-4 shrink-0">
         <div>
-          <span className="text-xs sm:text-sm font-bold tracking-[0.25em] text-teal-300 uppercase block">
-            Meeting Room System
-          </span>
-          <h1 className="text-4xl sm:text-5xl lg:text-6xl font-black tracking-tight text-white mt-1">
+          <h1 className="text-2xl sm:text-4xl lg:text-5xl font-black tracking-tight text-white">
             {room.name}
           </h1>
-          <div className="flex items-center gap-6 mt-3 text-sm text-slate-300">
-            <span className="flex items-center gap-2">
-              <MapPin className="w-4 h-4 text-teal-300" />
+          <div className="flex items-center gap-4 mt-1 text-xs sm:text-sm text-slate-300">
+            <span className="flex items-center gap-1.5">
+              <MapPin className="w-3.5 h-3.5 text-teal-300" />
               {room.location}
             </span>
             <span>•</span>
-            <span className="flex items-center gap-2">
-              <Users className="w-4 h-4 text-teal-300" />
+            <span className="flex items-center gap-1.5">
+              <Users className="w-3.5 h-3.5 text-teal-300" />
               Capacity: {room.capacity} Persons
             </span>
           </div>
         </div>
 
-        {/* Live Dubai Clock */}
+        {/* Live Dubai Clock & Date */}
         <div className="text-right">
-          <div className="text-4xl sm:text-5xl lg:text-6xl font-black font-mono tracking-tight text-white">
+          <div className="text-3xl sm:text-4xl lg:text-5xl font-black font-mono tracking-tight text-white">
             {dubaiTime || '--:--:--'}
           </div>
-          <div className="text-xs sm:text-sm font-medium text-slate-400 mt-1 uppercase tracking-wider">
-            {dubaiDate} • Dubai (UTC+4)
-          </div>
-          <div className="flex items-center justify-end gap-1.5 mt-2">
-            <span
-              className={`w-2.5 h-2.5 rounded-full ${
-                isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'
-              }`}
-            />
-            <span className="text-[11px] font-mono text-slate-400">
-              {isOnline ? 'Realtime Connected' : 'Reconnecting...'}
-            </span>
+          <div className="text-[11px] sm:text-xs font-medium text-slate-300 mt-0.5 uppercase tracking-wider">
+            {dubaiDate}
           </div>
         </div>
       </header>
 
-      {/* Center Hero: Status Banner + QR Scan Code */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 my-auto items-center">
-        {/* Left Column: Huge Status Banner & Next Meetings (8 cols) */}
-        <div className="lg:col-span-8 space-y-6">
+      {/* Center Hero: Status Banner, Next 3 Meetings & QR Code */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 lg:gap-6 my-auto items-stretch min-h-0 flex-1 py-3">
+        {/* Left / Main Section: Status Banner & Next Meetings (8 cols) */}
+        <div className="lg:col-span-8 flex flex-col justify-between gap-3 min-h-0">
+          {/* Main Status Banner */}
           <div
-            className={`p-8 sm:p-10 rounded-sm border-2 shadow-2xl transition-all ${
+            className={`p-5 sm:p-6 lg:p-8 rounded-sm border-2 shadow-xl flex flex-col justify-center flex-1 ${
               isFree
                 ? 'bg-emerald-950/80 border-emerald-400 text-emerald-100'
                 : isOccupied
@@ -207,58 +222,58 @@ export function DisplayClientView({
                 : 'bg-slate-900/80 border-slate-400 text-slate-200'
             }`}
           >
-            <div className="flex items-center gap-4 mb-2">
+            <div className="flex items-center gap-3 mb-1">
               <span
-                className={`w-4 h-4 rounded-full ${
+                className={`w-3.5 h-3.5 rounded-full ${
                   isFree
-                    ? 'bg-emerald-400 ring-8 ring-emerald-500/30 animate-pulse'
+                    ? 'bg-emerald-400 ring-4 ring-emerald-500/30 animate-pulse'
                     : isOccupied
-                    ? 'bg-rose-500 ring-8 ring-rose-500/30 animate-pulse'
+                    ? 'bg-rose-500 ring-4 ring-rose-500/30 animate-pulse'
                     : 'bg-slate-400'
                 }`}
               />
               <span className="text-xs sm:text-sm font-black tracking-widest uppercase">
-                {isFree ? 'Status: Free to Use' : isOccupied ? 'Status: Currently In Use' : 'Status: Unavailable'}
+                {isFree ? 'AVAILABLE NOW' : isOccupied ? 'OCCUPIED' : 'UNAVAILABLE'}
               </span>
             </div>
 
-            <div className="text-4xl sm:text-6xl font-black tracking-tight mt-2 uppercase">
+            <div className="text-2xl sm:text-4xl lg:text-5xl font-black tracking-tight mt-1 uppercase leading-tight">
               {currentStatus.bannerText}
             </div>
 
             {currentStatus.nextMeetingSummary && (
-              <p className="text-lg text-slate-300 mt-3 font-medium">
+              <p className="text-sm sm:text-base text-slate-200 mt-2 font-medium">
                 {currentStatus.nextMeetingSummary}
               </p>
             )}
           </div>
 
-          {/* Upcoming Next 3 Meetings */}
-          <div className="bg-white/5 border border-white/10 rounded-sm p-6">
-            <h3 className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-4 flex items-center gap-2">
-              <Clock className="w-4 h-4 text-teal-300" />
+          {/* Next 3 Meetings Today */}
+          <div className="bg-white/5 border border-white/10 rounded-sm p-4 sm:p-5 shrink-0">
+            <h3 className="text-[11px] sm:text-xs font-bold uppercase tracking-widest text-slate-300 mb-2.5 flex items-center gap-2">
+              <Clock className="w-3.5 h-3.5 text-teal-300" />
               Upcoming Meetings Today
             </h3>
 
             {nextMeetings.length === 0 ? (
-              <p className="text-sm text-slate-400 italic">
+              <p className="text-xs sm:text-sm text-slate-300 italic py-1">
                 No further meetings scheduled for today. Room is available.
               </p>
             ) : (
               <div className="divide-y divide-white/10">
                 {nextMeetings.map((m, idx) => (
-                  <div key={m.id} className="py-3 flex items-center justify-between first:pt-0 last:pb-0">
-                    <div className="flex items-center gap-4">
-                      <span className="w-6 h-6 rounded-xs bg-teal-900/50 text-teal-300 flex items-center justify-center font-bold text-xs">
+                  <div key={m.id} className="py-2 flex items-center justify-between first:pt-0 last:pb-0">
+                    <div className="flex items-center gap-3">
+                      <span className="w-5 h-5 rounded-xs bg-teal-900/60 text-teal-300 flex items-center justify-center font-bold text-[11px]">
                         {idx + 1}
                       </span>
                       <div>
-                        <div className="text-base font-bold text-white">{m.title}</div>
-                        <div className="text-xs text-slate-400">Organized by {m.organizer_name}</div>
+                        <div className="text-xs sm:text-sm font-bold text-white line-clamp-1">{m.title}</div>
+                        <div className="text-[11px] text-slate-300">Organized by {m.organizer_name}</div>
                       </div>
                     </div>
 
-                    <div className="text-right font-mono text-sm font-bold text-teal-300">
+                    <div className="text-right font-mono text-xs sm:text-sm font-bold text-teal-300">
                       {formatInDubai(m.start_time, 'HH:mm')} – {formatInDubai(m.end_time, 'HH:mm')}
                     </div>
                   </div>
@@ -268,33 +283,24 @@ export function DisplayClientView({
           </div>
         </div>
 
-        {/* Right Column: Prominent QR Code (4 cols) */}
-        <div className="lg:col-span-4 flex flex-col items-center justify-center bg-white/5 border border-white/10 rounded-sm p-8 text-center shadow-xl">
-          <div className="p-4 bg-white rounded-sm shadow-2xl inline-block border-2 border-white">
+        {/* Right Section: Large QR Code with Caption (4 cols) */}
+        <div className="lg:col-span-4 flex flex-col items-center justify-center bg-white/5 border border-white/10 rounded-sm p-5 sm:p-6 text-center shadow-lg">
+          <div className="p-3 bg-white rounded-sm shadow-xl inline-block border-2 border-white">
             <img
               src={qrDataUrl}
               alt="Scan QR"
-              className="w-56 h-56 sm:w-64 sm:h-64 object-contain"
+              className="w-40 h-40 sm:w-48 sm:h-48 lg:w-56 lg:h-56 object-contain"
             />
           </div>
 
-          <h3 className="text-xl font-black text-white mt-6 uppercase tracking-tight">
+          <h3 className="text-base sm:text-lg font-black text-white mt-4 uppercase tracking-tight">
             Scan with Phone to Book
           </h3>
-          <p className="text-xs text-slate-300 mt-1 max-w-xs leading-relaxed">
-            Directly reserve this room instantly with zero login required.
+          <p className="text-[11px] sm:text-xs text-slate-300 mt-1 max-w-xs leading-relaxed">
+            Scan QR code to view live timeline and reserve this room instantly.
           </p>
-          <div className="mt-4 px-3 py-1 bg-white/10 rounded-xs font-mono text-[11px] text-teal-200">
-            http://192.168.50.143/room/{room.id}
-          </div>
         </div>
       </div>
-
-      {/* Footer Info */}
-      <footer className="border-t border-white/10 pt-4 flex items-center justify-between text-xs text-slate-400">
-        <div>Meeting Room Booking • Dedicated Media Player Display</div>
-        <div className="font-mono">Server IP: 192.168.50.143 • Internal Network Only</div>
-      </footer>
     </div>
   );
 }

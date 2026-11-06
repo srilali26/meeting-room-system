@@ -37,6 +37,34 @@ export function createDubaiDateTime(dateStr: string, hour: number, minute: numbe
 }
 
 /**
+ * Returns the exact UTC start and end boundaries for a full day (00:00:00.000 to 23:59:59.999) in Asia/Dubai (UTC+4)
+ */
+export function getDubaiDayBoundaries(dateStr: string): { dayStart: Date; dayEnd: Date } {
+  const [yearStr, monthStr, dayStr] = dateStr.split('-');
+  const year = parseInt(yearStr, 10);
+  const month = parseInt(monthStr, 10) - 1;
+  const day = parseInt(dayStr, 10);
+  const dayStart = new Date(Date.UTC(year, month, day, 0 - DUBAI_UTC_OFFSET_HOURS, 0, 0, 0));
+  const dayEnd = new Date(Date.UTC(year, month, day, 23 - DUBAI_UTC_OFFSET_HOURS, 59, 59, 999));
+  return { dayStart, dayEnd };
+}
+
+/**
+ * Checks if a time range [startTimeIso, endTimeIso] overlaps the given Dubai day [00:00 to 23:59]
+ * Condition: start_time < dayEnd AND end_time > dayStart
+ */
+export function isOverlappingDubaiDay(
+  startTimeIso: string | Date,
+  endTimeIso: string | Date,
+  dateStr: string
+): boolean {
+  const { dayStart, dayEnd } = getDubaiDayBoundaries(dateStr);
+  const s = typeof startTimeIso === 'string' ? parseISO(startTimeIso) : startTimeIso;
+  const e = typeof endTimeIso === 'string' ? parseISO(endTimeIso) : endTimeIso;
+  return isBefore(s, dayEnd) && isAfter(e, dayStart);
+}
+
+/**
  * Generate timeline slots for a day taking into account bookings, blocked slots, and past status
  */
 export function generateDaySlots(

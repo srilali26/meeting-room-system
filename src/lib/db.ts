@@ -43,12 +43,12 @@ import {
   AdminUser,
   AdminSession,
   DisplayScreen,
-  AuditLog,
   AppSettings,
 } from '@/types';
 import {
   formatInDubai,
   createDubaiDateTime,
+  getDubaiDayBoundaries,
   DEFAULT_SETTINGS,
   computeRoomStatus,
 } from './timezone';
@@ -263,10 +263,9 @@ export class Database {
     }
 
     if (dateStr) {
-      const dayStart = createDubaiDateTime(dateStr, 0, 0).toISOString();
-      const dayEnd = createDubaiDateTime(dateStr, 23, 59).toISOString();
+      const { dayStart, dayEnd } = getDubaiDayBoundaries(dateStr);
       conditions.push(`start_time < $${idx++} AND end_time > $${idx++}`);
-      params.push(dayEnd, dayStart);
+      params.push(dayEnd.toISOString(), dayStart.toISOString());
     }
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -507,14 +506,25 @@ export class Database {
   // -------------------------
   // Blocked Slots
   // -------------------------
-  static async getBlockedSlots(roomId?: string): Promise<BlockedSlot[]> {
+  static async getBlockedSlots(roomId?: string, dateStr?: string): Promise<BlockedSlot[]> {
     const pool = getPool();
-    let sql = 'SELECT * FROM blocked_slots ORDER BY start_time ASC;';
+    const conditions: string[] = [];
     const params: any[] = [];
+    let idx = 1;
+
     if (roomId) {
-      sql = 'SELECT * FROM blocked_slots WHERE room_id IS NULL OR room_id = $1 ORDER BY start_time ASC;';
+      conditions.push(`(room_id IS NULL OR room_id = $${idx++})`);
       params.push(roomId);
     }
+
+    if (dateStr) {
+      const { dayStart, dayEnd } = getDubaiDayBoundaries(dateStr);
+      conditions.push(`(recurring_rule IS NOT NULL OR (start_time < $${idx++} AND end_time > $${idx++}))`);
+      params.push(dayEnd.toISOString(), dayStart.toISOString());
+    }
+
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const sql = `SELECT * FROM blocked_slots ${where} ORDER BY start_time ASC;`;
     const res = await pool.query(sql, params);
     return res.rows.map((b) => ({
       ...b,
@@ -828,38 +838,15 @@ export class Database {
   }
 
   // -------------------------
-  // Audit Logs (Table: audit_logs)
+  // Audit Logs (Disabled per Change 2)
   // -------------------------
   static async logAudit(
-    action: string,
-    actor: string,
-    ip_address: string,
-    details?: Record<string, any> | string
-  ): Promise<AuditLog> {
-    const pool = getPool();
-    const res = await pool.query(
-      `INSERT INTO audit_logs (action, actor, ip_address, details)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, action, actor, ip_address, details, created_at;`,
-      [action, actor, ip_address, typeof details === 'string' ? JSON.stringify({ message: details }) : details || null]
-    );
-    const log = res.rows[0];
-    return {
-      ...log,
-      created_at: new Date(log.created_at).toISOString(),
-    };
-  }
-
-  static async getAuditLogs(limit = 100): Promise<AuditLog[]> {
-    const pool = getPool();
-    const res = await pool.query(
-      'SELECT id, action, actor, ip_address, details, created_at FROM audit_logs ORDER BY created_at DESC LIMIT $1;',
-      [limit]
-    );
-    return res.rows.map((log) => ({
-      ...log,
-      created_at: new Date(log.created_at).toISOString(),
-    }));
+    _action?: string,
+    _actor?: string,
+    _ip_address?: string,
+    _details?: Record<string, any> | string
+  ): Promise<void> {
+    // Audit logging safely removed
   }
 
   // -------------------------
@@ -922,17 +909,24 @@ export class Database {
   // -------------------------
   // Dashboard Overview
   // -------------------------
-  static async getDashboardOverview() {
+  static async getDashboardOverview(dateStr?: string) {
     const rooms = await this.getRooms();
     const allBookings = await this.getBookings();
     const blockedSlots = await this.getBlockedSlots();
     const settings = await this.getSettings();
 
-    const todayStr = formatInDubai(new Date(), 'yyyy-MM-dd');
+    const targetDateStr = dateStr || formatInDubai(new Date(), 'yyyy-MM-dd');
+    const { dayStart, dayEnd } = getDubaiDayBoundaries(targetDateStr);
+
     const todayBookings = allBookings.filter((b) => {
-      const bDay = formatInDubai(b.start_time, 'yyyy-MM-dd');
-      return bDay === todayStr && b.status === 'confirmed';
+      if (b.status !== 'confirmed') return false;
+      const s = parseISO(b.start_time);
+      const e = parseISO(b.end_time);
+      return isBefore(s, dayEnd) && isAfter(e, dayStart);
     });
+
+    const workStart = createDubaiDateTime(targetDateStr, settings.work_start_hour, 0);
+    const workEnd = createDubaiDateTime(targetDateStr, settings.work_end_hour, 0);
 
     let totalHoursBooked = 0;
     const roomBookingCounts: Record<string, number> = {};
@@ -943,13 +937,15 @@ export class Database {
 
     todayBookings.forEach((b) => {
       roomBookingCounts[b.room_id] = (roomBookingCounts[b.room_id] || 0) + 1;
-      const s = parseISO(b.start_time).getTime();
-      const e = parseISO(b.end_time).getTime();
-      totalHoursBooked += (e - s) / (1000 * 60 * 60);
+      const s = Math.max(parseISO(b.start_time).getTime(), workStart.getTime());
+      const e = Math.min(parseISO(b.end_time).getTime(), workEnd.getTime());
+      if (e > s) {
+        totalHoursBooked += (e - s) / (1000 * 60 * 60);
+      }
     });
 
     const activeRooms = rooms.filter((r) => r.is_active);
-    const dayHours = settings.work_end_hour - settings.work_start_hour;
+    const dayHours = Math.max(1, settings.work_end_hour - settings.work_start_hour);
     const totalPossibleHours = activeRooms.length * dayHours;
 
     const utilization =

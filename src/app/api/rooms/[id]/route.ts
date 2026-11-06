@@ -19,7 +19,7 @@ export async function GET(
     const dateStr = searchParams.get('date') || formatInDubai(new Date(), 'yyyy-MM-dd');
 
     const bookings = await Database.getBookings(room.id, dateStr);
-    const blockedSlots = await Database.getBlockedSlots(room.id);
+    const blockedSlots = await Database.getBlockedSlots(room.id, dateStr);
     const settings = await Database.getSettings();
 
     const slots = generateDaySlots(dateStr, bookings, blockedSlots, settings);
